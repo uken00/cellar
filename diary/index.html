@@ -11,9 +11,18 @@
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
 <title>다이어리 2027</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
+<script>
+/* 구글 로그인 자동 연장용 숨은 창으로 열렸을 때: 결과만 바깥 화면에 넘기고 앱은 띄우지 않는다 */
+(function(){
+  if(window.self===window.top)return;
+  window.__framed=true;
+  try{if(/[#&](access_token|error)=/.test(location.hash))parent.postMessage({t:'d27auth',hash:location.hash},location.origin)}catch(e){}
+  try{window.stop()}catch(e){}
+})();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500&family=Noto+Serif+KR:wght@500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500&family=Noto+Serif+KR:wght@500;600&display=swap" rel="stylesheet" crossorigin>
 <style>
 :root{
   --desk:#E7E1D5; --paper:#FBF8F1; --paper2:#F3EEE3; --ink:#2A2824; --ink2:#67615A; --ink3:#9D978C; --rule:#E3DACA; --line:#CFC5B2;
@@ -232,6 +241,7 @@ textarea.t6{min-height:156px}
 <script>
 (function(){
 'use strict';
+if(window.__framed)return;   // 로그인 연장용 숨은 창 안에서는 앱을 띄우지 않는다
 /* ---------- 설정 ---------- */
 const CFG={
   GC:'Google Calendar', NO:'기록 시트',
@@ -269,14 +279,19 @@ function pDT(s){if(!s)return null;s=String(s);if(s.length<=10)return pYmd(s);con
 
 /* ---------- 상태 ---------- */
 const S={view:'week',cur:today(),page:0,mode:'spread',meetF:'전체',ideaF:'전체'};
-const EV=new Map();            // key -> event
-const covered={p:[],f:[],h:[]}; // loaded ranges
-const R={};                    // notion rows by key
-const ERR={gc:null,no:null};
+const EV=new Map();             // key -> 분류한 일정
+const RAW=new Map();            // key -> 캘린더에서 받은 원본(필요한 항목만). 기기에 저장해 둔다
+const FRESH={p:{},f:{},h:{}};   // 캘린더별 '2026-11' -> 마지막으로 받아 온 시각
+const TBL={};                   // 기록 시트 탭 -> {hdr,rows}. 기기에 저장해 둔다
+const CONF={};                  // 설정 탭 키 -> 값
+const R={};                     // 화면별 조회 결과(TBL에서 뽑은 것)
+const ERR={gc:null,no:null},ERRC={p:null,f:null,h:null};
 const busy=new Set();
 const drafts={daily:{},meet:null,idea:null};
 let habits=DEFAULT_HABITS.map(h=>({...h}));
-let mcp=null,mcpState='wait',flipping=false,lastViewKey='';
+const AUTH={st:'none',err:''};  // none 로그인 전 · ok 연결됨 · renew 연장 중 · need 다시 연결 필요 · off 오프라인
+let flipping=false,lastViewKey='',booted=false,UPD=false,touched=false,lastSync=0;
+const T0=Date.now();
 
 /* ---------- 유틸 ---------- */
 const $=s=>document.querySelector(s);
@@ -298,7 +313,7 @@ function errMsg(e,server){
   const c=(e&&e.code)||'http';
   const nm=server===CFG.GC?'Google 캘린더':'기록 시트';
   switch(c){
-    case 'auth':return '구글 로그인이 필요합니다.';
+    case 'auth':return '구글에 다시 연결해 주세요.';
     case 'network':return '인터넷 연결을 확인해 주세요.';
     case 'forbidden':return nm+'에 접근할 권한이 없습니다. 로그인할 때 권한을 모두 허용했는지 확인해 주세요.'+(e.message?' ('+String(e.message).slice(0,80)+')':'');
     case 'rate_limited':return '요청이 많아 잠시 막혔습니다. 조금 뒤에 다시 시도해 주세요.';
@@ -306,80 +321,203 @@ function errMsg(e,server){
   }
 }
 function errNote(k){
-  const e=ERR[k];if(!e)return'';
+  const e=ERR[k];if(!e||e.code==='auth')return'';
   const server=k==='gc'?CFG.GC:CFG.NO;
-  const btn=e.code==='auth'?'<button class="btn sm" data-act="login">로그인</button>':'<button class="btn sm" data-act="retry">다시 불러오기</button>';
-  return '<div class="note err">'+esc(errMsg(e,server))+btn+'</div>';
+  return '<div class="note err">'+esc(errMsg(e,server))+'<button class="btn sm" data-act="retry">다시 불러오기</button></div>';
 }
 
-/* ---------- 저장소·로그인 ---------- */
+/* ---------- 기기 저장소 ---------- */
 const LS={get(k){try{return JSON.parse(localStorage.getItem('d27.'+k))}catch(e){return null}},set(k,v){try{localStorage.setItem('d27.'+k,JSON.stringify(v))}catch(e){}},del(k){try{localStorage.removeItem('d27.'+k)}catch(e){}}};
 const SS={get(k){try{return JSON.parse(sessionStorage.getItem('d27.'+k))}catch(e){return null}},set(k,v){try{sessionStorage.setItem('d27.'+k,JSON.stringify(v))}catch(e){}},del(k){try{sessionStorage.removeItem('d27.'+k)}catch(e){}}};
-function redirectUri(){return location.origin+location.pathname.replace(/index\.html$/,'')}
-function persistState(){
-  const dd={};for(const k in drafts.daily){if(drafts.daily[k].dirty)dd[k]=drafts.daily[k]}
-  SS.set('state',{view:S.view,cur:ymd(S.cur),page:S.page,meetF:S.meetF,ideaF:S.ideaF,daily:dd,meet:drafts.meet&&drafts.meet.dirty?drafts.meet:null,idea:drafts.idea&&drafts.idea.dirty?drafts.idea:null});
-}
+/* 일정·기록처럼 큰 자료는 IndexedDB에 둔다. 쓸 수 없는 환경이면 조용히 건너뛴다 */
+const DB={
+  p:null,
+  open(){return this.p||(this.p=new Promise((res,rej)=>{let q;try{q=indexedDB.open('diary2027',1)}catch(e){rej(e);return}
+    q.onupgradeneeded=()=>{if(!q.result.objectStoreNames.contains('kv'))q.result.createObjectStore('kv')};
+    q.onsuccess=()=>res(q.result);q.onerror=()=>rej(q.error);q.onblocked=()=>rej(new Error('blocked'))}))},
+  async run(mode,fn){try{const db=await this.open();return await new Promise((res,rej)=>{const tx=db.transaction('kv',mode),q=fn(tx.objectStore('kv'));tx.oncomplete=()=>res(q&&q.result);tx.onerror=tx.onabort=()=>rej(tx.error)})}catch(e){return undefined}},
+  get(k){return this.run('readonly',s=>s.get(k))},
+  set(k,v){return this.run('readwrite',s=>s.put(v,k))},
+  del(k){return this.run('readwrite',s=>s.delete(k))}
+};
+/* 보던 화면: 구글에 다녀오거나 새 버전을 적용할 때만 잠깐 보관 */
+function persistState(){SS.set('state',{view:S.view,cur:ymd(S.cur),page:S.page,meetF:S.meetF,ideaF:S.ideaF});saveDraftsNow()}
 function restoreState(){
   const st=SS.get('state');if(!st)return;SS.del('state');
   S.view=st.view||S.view;S.cur=st.cur?pYmd(st.cur):S.cur;S.page=st.page||0;S.meetF=st.meetF||'전체';S.ideaF=st.ideaF||'전체';
-  Object.assign(drafts.daily,st.daily||{});if(st.meet)drafts.meet=st.meet;if(st.idea)drafts.idea=st.idea;
 }
+/* 쓰다 만 글: 입력할 때마다 기기에 남겨 두고, 저장하면 지운다 */
+let draftT=null;
+function saveDraftsNow(){
+  clearTimeout(draftT);draftT=null;
+  const dd={};for(const k in drafts.daily){if(drafts.daily[k].dirty)dd[k]=drafts.daily[k]}
+  const m=drafts.meet&&drafts.meet.dirty?drafts.meet:null,i=drafts.idea&&drafts.idea.dirty?drafts.idea:null;
+  if(Object.keys(dd).length||m||i)LS.set('drafts',{at:Date.now(),daily:dd,meet:m,idea:i});else LS.del('drafts');
+}
+function saveDraftsSoon(){if(!draftT)draftT=setTimeout(saveDraftsNow,700)}
+function restoreDrafts(){
+  const o=LS.get('drafts');if(!o)return;
+  if(Date.now()-(o.at||0)>14*864e5){LS.del('drafts');return}
+  for(const k in (o.daily||{})){const d=o.daily[k];if(d&&d.f){d.saving=false;drafts.daily[k]=d}}
+  if(o.meet&&o.meet.f){o.meet.saving=false;drafts.meet=o.meet}
+  if(o.idea&&o.idea.f){o.idea.saving=false;drafts.idea=o.idea}
+}
+
+/* ---------- 구글 연결 ----------
+   접속 토큰은 1시간짜리다. 만료되면 화면 뒤 숨은 창으로 조용히 새로 받고(silentFrame),
+   그 방법이 막힌 기기에서는 화면 전체가 구글에 잠깐 다녀온다(startAuth(true)).
+   둘 다 안 되면 저장해 둔 내용을 보여 주면서 '다시 연결'을 안내한다. */
+const APP_VER='2.0',BUILD='20261118.1';
+const AUTH_URL='https://accounts.google.com/o/oauth2/v2/auth';
+function redirectUri(){return location.origin+location.pathname.replace(/index\.html$/,'')}
+function rnd(){const a=new Uint8Array(12);crypto.getRandomValues(a);return [...a].map(b=>b.toString(16).padStart(2,'0')).join('')}
+function authUrl(state,silent){
+  const p=new URLSearchParams({client_id:CFG.clientId,redirect_uri:redirectUri(),response_type:'token',scope:CFG.scope,include_granted_scopes:'true',state});
+  if(silent)p.set('prompt','none');
+  const h=LS.get('hint');if(h)p.set('login_hint',h);   // 여러 계정이 로그인된 기기에서 어느 계정인지 알려 줌
+  return AUTH_URL+'?'+p.toString();
+}
+function saveToken(h){LS.set('token',{t:h.get('access_token'),exp:Date.now()+((+h.get('expires_in'))||3600)*1000-60000})}
+function tokenValid(){const t=LS.get('token');return t&&t.exp>Date.now()?t.t:null}
+function logAuth(how,ok,err){
+  const a=LS.get('authLog')||[],res=ok?'ok':String(err||'fail').slice(0,40),l=a[a.length-1];
+  if(l&&l[1]===how&&l[2]===res){l[0]=Date.now();l[3]=(l[3]||1)+1}else a.push([Date.now(),how,res]);
+  while(a.length>10)a.shift();LS.set('authLog',a);
+}
+function setAuth(st,err){AUTH.err=err||'';if(AUTH.st===st)return;AUTH.st=st;if(booted)render()}
+const quiet=()=>sheet.hidden&&!flipping&&!(document.activeElement&&/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName));
+const canBounce=()=>!LS.get('needLogin')&&Date.now()-(LS.get('bounceAt')||0)>600000;
 function startAuth(silent){
   persistState();
-  const st=Math.random().toString(36).slice(2);LS.set('authState',st);
-  const p=new URLSearchParams({client_id:CFG.clientId,redirect_uri:redirectUri(),response_type:'token',scope:CFG.scope,include_granted_scopes:'true',state:st});
-  if(silent)p.set('prompt','none');
-  location.href='https://accounts.google.com/o/oauth2/v2/auth?'+p.toString();
+  const st=rnd();LS.set('authState',{st,silent:!!silent});
+  if(silent){LS.set('bounceAt',Date.now());location.replace(authUrl(st,true))}
+  else location.href=authUrl(st,false);
 }
+/* 구글에 다녀온 결과(주소 뒤 #…)를 읽는다 */
 function readAuthHash(){
   if(!location.hash||location.hash.length<5)return null;
   const h=new URLSearchParams(location.hash.slice(1));
   if(!h.get('access_token')&&!h.get('error'))return null;
   history.replaceState(null,'',location.pathname+location.search);
-  if(h.get('error'))return {error:h.get('error')};
-  if(h.get('state')!==LS.get('authState'))return {error:'state'};
-  LS.set('token',{t:h.get('access_token'),exp:Date.now()+((+h.get('expires_in'))||3600)*1000-60000});
-  LS.set('hadLogin',true);SS.del('silentTried');return {ok:true};
+  let as=LS.get('authState');LS.del('authState');if(typeof as==='string')as={st:as};as=as||{};
+  const silent=!!as.silent,how=silent?'redirect':'login';
+  let err='';
+  if(h.get('error'))err=h.get('error');else if(!as.st||h.get('state')!==as.st)err='state';
+  if(err){logAuth(how,false,err);if(silent)LS.set('needLogin',err);return {error:err,silent}}
+  saveToken(h);LS.set('hadLogin',true);LS.del('needLogin');
+  if(silent)LS.set('silentMode','redirect');
+  logAuth(how,true);return {ok:true,silent};
 }
-function tokenValid(){const t=LS.get('token');return t&&t.exp>Date.now()?t.t:null}
-let authPrompted=false;
-function authNeeded(){
-  if(authPrompted)return;authPrompted=true;mcp=null;mcpState='login';
-  if(LS.get('hadLogin')&&!SS.get('silentTried')){SS.set('silentTried',1);startAuth(true);return}
-  render();
+/* 화면 뒤 숨은 창으로 새 토큰 받기. 숨은 창 안에서는 <head>의 짧은 스크립트가 결과만 넘겨준다 */
+function silentFrame(){
+  return new Promise(res=>{
+    const st='f'+rnd();let done=false,tm=null,fr=null;
+    const fin=r=>{if(done)return;done=true;clearTimeout(tm);removeEventListener('message',onMsg);try{fr.remove()}catch(e){}res(r)};
+    const onMsg=e=>{
+      if(e.origin!==location.origin||!fr||e.source!==fr.contentWindow)return;
+      const d=e.data;if(!d||d.t!=='d27auth'||typeof d.hash!=='string')return;
+      const h=new URLSearchParams(d.hash.replace(/^#/,''));
+      if(h.get('state')!==st)return fin({ok:false,err:'state'});
+      if(h.get('error'))return fin({ok:false,err:h.get('error')});
+      if(!h.get('access_token'))return fin({ok:false,err:'empty'});
+      saveToken(h);fin({ok:true});
+    };
+    addEventListener('message',onMsg);
+    fr=document.createElement('iframe');
+    fr.setAttribute('aria-hidden','true');fr.tabIndex=-1;
+    fr.style.cssText='position:fixed;left:-9999px;top:0;width:10px;height:10px;border:0;visibility:hidden';
+    tm=setTimeout(()=>fin({ok:false,err:'timeout'}),6000);
+    fr.src=authUrl(st,true);
+    document.body.appendChild(fr);
+  });
 }
-async function gfetch(url,opt){
-  const tk=tokenValid();if(!tk){authNeeded();throw {code:'auth'}}
-  opt=Object.assign({},opt||{});opt.headers=Object.assign({'Authorization':'Bearer '+tk},opt.body?{'Content-Type':'application/json'}:{});
-  let r;try{r=await fetch(url,opt)}catch(e){throw {code:'network',message:String(e&&e.message||e)}}
-  if(r.status===401){LS.del('token');authNeeded();throw {code:'auth'}}
+let renewP=null;
+function renew(){
+  if(renewP)return renewP;
+  renewP=(async()=>{
+    if(!navigator.onLine)return {ok:false,err:'offline'};
+    const r=await silentFrame();
+    logAuth('frame',r.ok,r.err);
+    if(r.ok){LS.set('silentMode','frame');LS.del('needLogin')}
+    return r;
+  })();
+  renewP.then(()=>{renewP=null},()=>{renewP=null});
+  return renewP;
+}
+/* 구글까지 통신이 되는지(응답이 없었던 까닭이 통신 문제인지 가리려고) */
+async function reachable(){
+  try{const c=new AbortController(),t=setTimeout(()=>c.abort(),4000);await fetch('https://www.gstatic.com/generate_204',{mode:'no-cors',cache:'no-store',signal:c.signal});clearTimeout(t);return true}catch(e){return false}
+}
+/* 조용한 연장이 실패했을 때: 가능하면 화면이 잠깐 다녀오고, 아니면 '다시 연결' 안내 */
+async function lost(r){
+  const e=r&&r.err;
+  if(e==='offline'){setAuth('off');return 'off'}
+  if(canBounce()&&document.visibilityState==='visible'){
+    if(e==='timeout'&&!(await reachable())){setAuth('off');return 'off'}   // 통신이 안 될 때는 화면을 옮기지 않는다
+    if(quiet()&&!tokenValid()){startAuth(true);return 'bounce'}
+  }
+  if(tokenValid()){setAuth('ok');return 'ok'}
+  setAuth('need',e);return 'need';
+}
+async function getToken(){
+  let t=tokenValid();if(t){if(AUTH.st!=='ok')setAuth('ok');return t}
+  if(!LS.get('hadLogin')){setAuth('none');throw {code:'auth'}}
+  if(AUTH.st==='need')throw {code:'auth'};
+  const r=await renew();
+  t=tokenValid();if(t){setAuth('ok');return t}
+  const w=await lost(r);
+  if(w==='ok')return tokenValid();
+  throw {code:w==='off'?'network':'auth'};
+}
+/* 앱을 열 때·돌아올 때: 토큰이 없으면 조용히 받아 본다 */
+async function connect(){
+  if(tokenValid()){setAuth('ok');return true}
+  if(!LS.get('hadLogin')){setAuth('none');return false}
+  if(!navigator.onLine){setAuth('off');return false}
+  if(AUTH.st!=='need')setAuth('renew');
+  const r=await renew();
+  if(tokenValid()){setAuth('ok');return true}
+  return (await lost(r))==='ok';
+}
+const okMail=m=>typeof m==='string'&&/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(m)&&!/calendar\.google\.com$/i.test(m);
+const maskMail=m=>{const i=m.indexOf('@');return m.slice(0,Math.min(3,i))+'***'+m.slice(i)};
+/* 연결된 계정 주소는 이 기기에만 두고, 구글에 '이 계정으로'라고 알릴 때만 쓴다 */
+async function learnHint(){
+  if(LS.get('hint')||!tokenValid())return;
+  try{const r=await gfetch('https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)');const m=r&&r.user&&r.user.emailAddress;if(okMail(m))LS.set('hint',m)}catch(e){}
+}
+async function gfetch(url,opt,again){
+  const tk=await getToken();
+  const o=Object.assign({},opt||{});o.headers=Object.assign({'Authorization':'Bearer '+tk},o.body?{'Content-Type':'application/json'}:{});
+  let r;try{r=await fetch(url,o)}catch(e){throw {code:'network',message:String(e&&e.message||e)}}
+  if(r.status===401){LS.del('token');if(!again)return gfetch(url,opt,true);setAuth('need','401');throw {code:'auth'}}
   if(!r.ok){let m='';try{const j=await r.json();m=(j.error&&j.error.message)||''}catch(e){}throw {code:r.status===403?'forbidden':r.status===429?'rate_limited':'http',status:r.status,message:m,retryable:r.status>=500||r.status===429}}
   if(r.status===204)return {};
   const tx=await r.text();return tx?JSON.parse(tx):{};
 }
 /* 캘린더 */
 const GCAL='https://www.googleapis.com/calendar/v3/calendars/';
+const EVF='id,status,summary,description,location,htmlLink,colorId,start,end,updated';
 const COLOR={'미팅':'9','통화':'9','고객':'9','지점':'9','교육':'9','기관':'9','현장조사':'9','현장':'9','영업':'9','심사':'9','발송':'9','내부':'9','서류':'9','출장':'9','마감':'3','골프':'10','금융':'11','운동':'7','건강':'7','가족':'4','모임':'4','이동':'6','식사':'5','여행':'8','생활':'8','학습':'8'};
 function colorFor(summary){const m=String(summary||'').match(/^✔?\[(?:대신|선우|메트|개인)·([^\]]+)\]/);return m&&COLOR[m[1]]||''}
 async function call(server,tool,input){
-  if(!mcp)throw {code:'auth'};
   if(tool==='list_events'){
-    const q=new URLSearchParams({timeMin:input.startTime+tzOff(),timeMax:input.endTime+tzOff(),singleEvents:'true',orderBy:'startTime',maxResults:'250'});
+    const q=new URLSearchParams({timeMin:input.startTime+tzOff(),timeMax:input.endTime+tzOff(),singleEvents:'true',orderBy:'startTime',maxResults:'2500',
+      fields:'nextPageToken,items('+EVF+(LS.get('hint')?'':',organizer(email,self)')+')'});
     if(input.pageToken)q.set('pageToken',input.pageToken);
     const r=await gfetch(GCAL+encodeURIComponent(input.calendarId||'primary')+'/events?'+q.toString());
     return {events:r.items||[],nextPageToken:r.nextPageToken};
   }
   if(tool==='update_event'){
     const b={summary:input.summary};const c=colorFor(input.summary);if(c)b.colorId=c;
-    return gfetch(GCAL+'primary/events/'+encodeURIComponent(input.eventId)+'?sendUpdates=none',{method:'PATCH',body:JSON.stringify(b)});
+    return gfetch(GCAL+'primary/events/'+encodeURIComponent(input.eventId)+'?sendUpdates=none&fields='+EVF,{method:'PATCH',body:JSON.stringify(b)});
   }
   if(tool==='create_event'){
     const b={summary:input.summary};if(input.description)b.description=input.description;
     if(input.allDay){b.start={date:input.startTime.slice(0,10)};b.end={date:input.endTime.slice(0,10)};b.transparency='transparent'}
     else{b.start={dateTime:input.startTime,timeZone:'Asia/Seoul'};b.end={dateTime:input.endTime,timeZone:'Asia/Seoul'}}
     const c=colorFor(input.summary);if(c)b.colorId=c;
-    return gfetch(GCAL+'primary/events?sendUpdates=none',{method:'POST',body:JSON.stringify(b)});
+    return gfetch(GCAL+'primary/events?sendUpdates=none&fields='+EVF,{method:'POST',body:JSON.stringify(b)});
   }
   throw {code:'http',message:'알 수 없는 요청'};
 }
@@ -394,6 +532,8 @@ const STAB={
 };
 let SHEET_ID=LS.get('sheetId'),sheetP=null;
 const rng=(tab,a)=>encodeURIComponent("'"+tab+"'!"+a);
+const colName=n=>{let s='';while(n>0){const m=(n-1)%26;s=String.fromCharCode(65+m)+s;n=(n-1-m)/26}return s};
+const hdrData=tabs=>tabs.map(t=>({range:"'"+t.name+"'!A1",values:[t.cols.map(c=>c[0])]}));
 async function ensureSheet(){
   if(SHEET_ID)return SHEET_ID;
   const q=encodeURIComponent("name='"+CFG.sheetTitle+"' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false");
@@ -402,54 +542,136 @@ async function ensureSheet(){
   else{
     const body={properties:{title:CFG.sheetTitle,locale:'ko_KR',timeZone:'Asia/Seoul'},sheets:Object.values(STAB).map(t=>({properties:{title:t.name,gridProperties:{frozenRowCount:1}}}))};
     const c=await gfetch(SHEETS,{method:'POST',body:JSON.stringify(body)});SHEET_ID=c.spreadsheetId;
-    await gfetch(SHEETS+SHEET_ID+'/values:batchUpdate',{method:'POST',body:JSON.stringify({valueInputOption:'RAW',data:Object.values(STAB).map(t=>({range:"'"+t.name+"'!A1",values:[t.cols.map(c=>c[0])]}))})});
+    await gfetch(SHEETS+SHEET_ID+'/values:batchUpdate',{method:'POST',body:JSON.stringify({valueInputOption:'RAW',data:hdrData(Object.values(STAB))})});
   }
   LS.set('sheetId',SHEET_ID);return SHEET_ID;
 }
 function gsheet(){return sheetP||(sheetP=ensureSheet().catch(e=>{sheetP=null;throw e}))}
-const TBL={},TBLP={};
-async function loadTab(ds,force){
-  const c=TBL[ds];if(c&&!force&&Date.now()-c.at<30000)return c;
-  if(TBLP[ds]&&!force)return TBLP[ds];
-  const t=STAB[ds];
-  TBLP[ds]=(async()=>{
-    const id=await gsheet();const r=await gfetch(SHEETS+id+'/values/'+rng(t.name,'A1:Z2000'));
-    const vals=r.values||[],hdr=(vals[0]&&vals[0].length)?vals[0]:t.cols.map(x=>x[0]);
-    const rows=vals.slice(1).map((v,i)=>{const o={_row:i+2};t.cols.forEach(([h,k])=>{const j=hdr.indexOf(h);o[k||h]=j>=0&&v[j]!=null?v[j]:''});o.url=o.id;return o}).filter(o=>o.id);
-    return TBL[ds]={at:Date.now(),hdr,rows};
-  })();
-  try{return await TBLP[ds]}finally{delete TBLP[ds]}
+function forgetSheet(){SHEET_ID=null;sheetP=null;LS.del('sheetId')}
+/* 탭이 지워졌으면 다시 만든다 */
+async function repairSheet(id){
+  const meta=await gfetch(SHEETS+id+'?fields=sheets.properties.title');
+  const have=(meta.sheets||[]).map(s=>s.properties.title),miss=Object.values(STAB).filter(t=>!have.includes(t.name));
+  if(!miss.length)return false;
+  await gfetch(SHEETS+id+':batchUpdate',{method:'POST',body:JSON.stringify({requests:miss.map(t=>({addSheet:{properties:{title:t.name,gridProperties:{frozenRowCount:1}}}}))})});
+  await gfetch(SHEETS+id+'/values:batchUpdate',{method:'POST',body:JSON.stringify({valueInputOption:'RAW',data:hdrData(miss)})});
+  return true;
+}
+function parseTab(ds,vals){
+  const t=STAB[ds],hdr=(vals[0]&&vals[0].length)?vals[0].map(String):t.cols.map(x=>x[0]),known={};
+  t.cols.forEach(([h,k])=>{known[h]=k||h});
+  const rows=[];
+  for(let i=1;i<vals.length;i++){
+    const v=vals[i];if(!v||!v.length)continue;
+    const o={_row:i+1};t.cols.forEach(([h,k])=>{o[k||h]=''});
+    hdr.forEach((h,j)=>{const x=v[j]!=null?String(v[j]):'';if(known[h])o[known[h]]=x;else if(x)o['x:'+h]=x});   // 직접 추가한 열도 보존
+    if(!o.id)continue;o.url=o.id;rows.push(o);
+  }
+  return {hdr,rows};
 }
 function cellVal(v){if(v==null)return '';if(Array.isArray(v))return JSON.stringify(v);return String(v)}
-function rowArr(ds,hdr,o){const t=STAB[ds];return hdr.map(h=>{const c=t.cols.find(x=>x[0]===h);return cellVal(o[c?(c[1]||c[0]):h])})}
+function rowArr(ds,hdr,o){const t=STAB[ds];return hdr.map(h=>{const c=t.cols.find(x=>x[0]===h);return cellVal(c?o[c[1]||c[0]]:o['x:'+h])})}
+function normRow(ds,o){const r={};STAB[ds].cols.forEach(([h,k])=>{r[k||h]=cellVal(o[k||h])});r.url=r.id;return r}
 function newId(){const a=new Uint8Array(16);crypto.getRandomValues(a);return [...a].map(b=>b.toString(16).padStart(2,'0')).join('')}
-async function nQuery(ds,filters,sort,limit){
-  const tb=await loadTab(ds);let rows=tb.rows.slice();
-  for(const f of (filters||[])){const k='date:'+f.property+':start',v=f.value.value;rows=rows.filter(r=>{const x=String(r[k]||'').slice(0,10);if(!x)return false;
-    switch(f.operator){case 'date_is':return x===v;case 'date_is_on_or_after':return x>=v;case 'date_is_before':return x<v;case 'date_is_on_or_before':return x<=v;case 'date_is_after':return x>v;default:return true}})}
-  if(sort&&sort[0]){const k='date:'+sort[0].property+':start',dr=sort[0].direction==='descending'?-1:1;rows.sort((a,b)=>String(a[k]||'').localeCompare(String(b[k]||''))*dr)}
-  return rows.slice(0,limit||1000).map(r=>Object.assign({},r));
+function hash(s){let h=5381;for(let i=0;i<s.length;i++)h=((h<<5)+h+s.charCodeAt(i))|0;return h||1}
+let tblP=null,tblAt=0,tblSig=0,tbT=null,writing=0,wseq=0;
+const TBL_TTL=180000;
+function applyConf(){
+  if(!CONF.habits)return;
+  try{const a=JSON.parse(CONF.habits);if(Array.isArray(a)&&a.length){habits=a;try{localStorage.setItem('diary2027.habits',JSON.stringify(a))}catch(e){}}}catch(e){}
+}
+function saveTablesSoon(){if(tbT)return;tbT=setTimeout(()=>{tbT=null;const tabs={};for(const k in TBL)tabs[k]=TBL[k];DB.set('tables',{v:1,at:tblAt,sig:tblSig,sheet:SHEET_ID,tabs,conf:Object.assign({},CONF)})},1200)}
+function tblChanged(){dropRows();saveTablesSoon()}
+/* 다섯 탭을 한 번의 요청으로 받아 온다. 내용이 그대로면 화면을 다시 그리지 않는다 */
+function syncTables(force){
+  if(tblP)return tblP;
+  if(!force&&tblAt&&Date.now()-tblAt<TBL_TTL)return Promise.resolve(false);
+  busy.add('tbl');syncDot();
+  const w0=wseq,names=Object.keys(STAB),url=id=>SHEETS+id+'/values:batchGet?'+names.map(k=>'ranges='+rng(STAB[k].name,'A:Z')).join('&');
+  tblP=(async()=>{
+    try{
+      let id=await gsheet(),r;
+      try{r=await gfetch(url(id))}
+      catch(e){
+        if(e.status===404){forgetSheet();id=await gsheet();r=await gfetch(url(id))}
+        else if(e.status===400&&await repairSheet(id))r=await gfetch(url(id));
+        else throw e;
+      }
+      const vr=names.map((k,i)=>((r.valueRanges||[])[i]||{}).values||[]);
+      const fix=names.filter((k,i)=>!(vr[i][0]&&vr[i][0].length));   // 첫 줄 제목이 비어 있는 탭
+      if(fix.length){await gfetch(SHEETS+id+'/values:batchUpdate',{method:'POST',body:JSON.stringify({valueInputOption:'RAW',data:hdrData(fix.map(k=>STAB[k]))})});fix.forEach(k=>{vr[names.indexOf(k)][0]=STAB[k].cols.map(c=>c[0])})}
+      if(writing||wseq!==w0){tblAt=0;setTimeout(()=>syncTables(),1500);return false}   // 받는 사이 저장이 있었으면 버리고 다시 받는다
+      const sig=hash(JSON.stringify(vr));
+      tblAt=lastSync=Date.now();ERR.no=null;
+      if(sig===tblSig)return false;
+      tblSig=sig;
+      names.forEach((k,i)=>{
+        if(k==='conf'){for(const x in CONF)delete CONF[x];vr[i].slice(1).forEach(v=>{if(v&&v[0])CONF[v[0]]=v[1]==null?'':String(v[1])})}
+        else TBL[k]=parseTab(k,vr[i]);
+      });
+      applyConf();tblChanged();
+      return true;
+    }catch(e){
+      const show=e.code!=='auth'&&!(e.code==='network'&&TBL.daily);
+      if(show)ERR.no=e;
+      return show;
+    }finally{tblP=null;busy.delete('tbl');syncDot()}
+  })();
+  tblP.then(ch=>{if(ch)render()});
+  return tblP;
 }
 async function nCreate(ds,props){
-  const tb=await loadTab(ds,true),id=newId(),sid=await gsheet();
-  await gfetch(SHEETS+sid+'/values/'+rng(STAB[ds].name,'A1')+':append?valueInputOption=RAW&insertDataOption=INSERT_ROWS',{method:'POST',body:JSON.stringify({values:[rowArr(ds,tb.hdr,Object.assign({},props,{id}))]})});
-  delete TBL[ds];return id;
+  if(!TBL[ds])await syncTables(true);
+  const tb=TBL[ds];if(!tb)throw (AUTH.st==='need'||AUTH.st==='none')?{code:'auth'}:(ERR.no||{code:'network'});
+  const id=newId(),sid=await gsheet(),o=Object.assign({},props,{id});
+  let r;writing++;wseq++;
+  try{r=await gfetch(SHEETS+sid+'/values/'+rng(STAB[ds].name,'A1')+':append?valueInputOption=RAW&insertDataOption=INSERT_ROWS',{method:'POST',body:JSON.stringify({values:[rowArr(ds,tb.hdr,o)]})})}
+  finally{writing--}
+  const m=String((r.updates&&r.updates.updatedRange)||'').match(/!\$?[A-Z]+\$?(\d+)/);
+  const row=normRow(ds,o);row._row=m?+m[1]:0;
+  (TBL[ds]||tb).rows.push(row);tblChanged();
+  if(!row._row){tblAt=0;syncTables()}
+  return id;
 }
-async function nUpdate(id,props){
-  for(const ds of ['daily','goal','meet','idea']){
-    let tb=await loadTab(ds);if(!tb.rows.some(x=>x.id===id))continue;
-    tb=await loadTab(ds,true);const r=tb.rows.find(x=>x.id===id);if(!r)break;
-    const o=Object.assign({},r);for(const k in props){if(/:(is_datetime|end)$/.test(k))continue;o[k]=props[k]==null?'':props[k]}
-    const sid=await gsheet(),last=String.fromCharCode(64+Math.min(26,tb.hdr.length));
-    await gfetch(SHEETS+sid+'/values/'+rng(STAB[ds].name,'A'+r._row+':'+last+r._row)+'?valueInputOption=RAW',{method:'PUT',body:JSON.stringify({values:[rowArr(ds,tb.hdr,o)]})});
-    delete TBL[ds];return {};
+async function nUpdate(id,props,ds){
+  for(const d of (ds?[ds]:['daily','goal','meet','idea'])){
+    if(!TBL[d])await syncTables(true);
+    const tb=TBL[d],r=tb&&tb.rows.find(x=>x.id===id);if(!r)continue;
+    const sid=await gsheet(),name=STAB[d].name;
+    writing++;wseq++;
+    try{
+      // 시트에서 줄이 옮겨졌을 수 있으니 그 줄의 id부터 확인하고 쓴다
+      let ok=false;
+      if(r._row){const v=await gfetch(SHEETS+sid+'/values/'+rng(name,'A'+r._row));ok=!!(v.values&&v.values[0]&&String(v.values[0][0])===id)}
+      if(!ok){
+        const v=await gfetch(SHEETS+sid+'/values/'+rng(name,'A:A')),i=(v.values||[]).findIndex(x=>x&&String(x[0])===id);
+        if(i<1)throw {code:'http',message:'수정할 기록을 시트에서 찾지 못했습니다.'};
+        r._row=i+1;tblAt=0;
+      }
+      const o=Object.assign({},r);for(const k in props){if(/:(is_datetime|end)$/.test(k))continue;o[k]=cellVal(props[k])}
+      await gfetch(SHEETS+sid+'/values/'+rng(name,'A'+r._row+':'+colName(tb.hdr.length)+r._row)+'?valueInputOption=RAW',{method:'PUT',body:JSON.stringify({values:[rowArr(d,tb.hdr,o)]})});
+      Object.assign(r,o);
+    }finally{writing--}
+    tblChanged();
+    if(!tblAt)syncTables();
+    return {};
   }
   throw {code:'http',message:'수정할 기록을 시트에서 찾지 못했습니다.'};
 }
-async function confGet(){const sid=await gsheet();const r=await gfetch(SHEETS+sid+'/values/'+rng('설정','A2:B50'));const m={};(r.values||[]).forEach(v=>{if(v[0])m[v[0]]=v[1]||''});return m}
-async function confSet(key,val){const sid=await gsheet();const r=await gfetch(SHEETS+sid+'/values/'+rng('설정','A2:A50'));const ks=(r.values||[]).map(v=>v[0]);const i=ks.indexOf(key),row=i>=0?i+2:ks.length+2;
-  await gfetch(SHEETS+sid+'/values/'+rng('설정','A'+row+':B'+row)+'?valueInputOption=RAW',{method:'PUT',body:JSON.stringify({values:[[key,val]]})})}
-function syncDot(){const el=$('#syncdot');if(!el)return;el.className='sync '+(busy.size?'busy':(ERR.gc||ERR.no)?'err':mcp?'ok':'')}
+async function confSet(key,val){
+  const sid=await gsheet();
+  writing++;wseq++;
+  try{
+    const r=await gfetch(SHEETS+sid+'/values/'+rng('설정','A2:A50')),ks=(r.values||[]).map(v=>v[0]),i=ks.indexOf(key),row=i>=0?i+2:ks.length+2;
+    await gfetch(SHEETS+sid+'/values/'+rng('설정','A'+row+':B'+row)+'?valueInputOption=RAW',{method:'PUT',body:JSON.stringify({values:[[key,val]]})});
+  }finally{writing--}
+  CONF[key]=val;saveTablesSoon();
+}
+let loadShown=false;
+function syncDot(){
+  if(!busy.size&&loadShown){loadShown=false;setTimeout(render,0)}   // '불러오는 중…' 문구를 남기지 않는다
+  const el=$('#syncdot');if(!el)return;el.className='sync '+(busy.size?'busy':(ERR.gc||ERR.no)?'err':AUTH.st==='ok'?'ok':'');
+}
 
 /* ---------- 캘린더 ---------- */
 function classify(e,cal){
@@ -489,27 +711,105 @@ function parseReview(e){
   REVCAL[k]={obs:(Array.isArray(o['관찰'])?o['관찰']:[]).map(String),sug:(Array.isArray(o['제안'])?o['제안']:[]).map(x=>({a:AREAS.includes(x&&x['영역'])?x['영역']:'개인',t:String((x&&x['내용'])||'')})).filter(x=>x.t),link:e.htmlLink||''};
 }
 function buildSummary(e,area,act){return (e.done?'✔':'')+'['+area+(act?'·'+act:'')+'] '+(e.tag==='카톡'?'[카톡] ':'')+e.title}
-function isCovered(cal,from,to){return covered[cal].some(r=>r[0]<=from&&r[1]>=to)}
-async function loadEvents(from,to,cals,force){
-  cals=cals||['p','f','h'];
-  const jobs=cals.filter(c=>force||!isCovered(c,+from,+to)).map(async c=>{
-    const bk='ev'+c+ymd(from);if(busy.has(bk))return;busy.add(bk);syncDot();
-    try{
-      let token=null,all=[],n=0;
-      do{
-        const input={startTime:ymd(from)+'T00:00:00',endTime:ymd(to)+'T00:00:00',orderBy:'startTime',pageSize:250};
-        if(c!=='p')input.calendarId=CFG.cal[c];
-        if(token)input.pageToken=token;
-        const p=await call(CFG.GC,'list_events',input,{cache:{staleTime:60000,gcTime:600000}},true);
-        all=all.concat((p&&p.events)||[]);token=p&&p.nextPageToken;n++;
-      }while(token&&n<5);
-      for(const [k,v] of EV){if(v.cal===c&&v.start<to&&v.end>=from)EV.delete(k)}
-      for(const e of all){if(e.status==='cancelled'||!e.start)continue;if(/돌아보기\s*\(Claude\)/.test(e.summary||'')){parseReview(e);continue}const ev=classify(e,c);EV.set(ev.key,ev)}
-      covered[c].push([+from,+to]);ERR.gc=null;
-    }catch(e){if(c!=='h'||!ERR.gc)ERR.gc=e}
-    finally{busy.delete(bk);syncDot()}
-  });
-  if(jobs.length){await Promise.all(jobs);render()}
+/* 일정은 '캘린더 × 달' 단위로 받아 기기에 저장해 두고, 화면은 저장본으로 먼저 그린다 */
+const mk=d=>d.getFullYear()+'-'+pad(d.getMonth()+1);
+const mkDate=k=>new Date(+k.slice(0,4),+k.slice(5,7)-1,1);
+const mkNext=k=>{const d=mkDate(k);return mk(new Date(d.getFullYear(),d.getMonth()+1,1))};
+function monthsOf(from,to){const out=[];let d=new Date(from.getFullYear(),from.getMonth(),1);while(d<to&&out.length<240){out.push(mk(d));d=new Date(d.getFullYear(),d.getMonth()+1,1)}return out}
+const EV_TTL={p:180000,f:180000,h:7*864e5};
+const evBusy={};
+function ingest(e,c){
+  if(!e||!e.id||e.status==='cancelled'||!e.start)return;
+  if(e.organizer){if(c==='p'&&e.organizer.self&&okMail(e.organizer.email)&&!LS.get('hint'))LS.set('hint',e.organizer.email);delete e.organizer}
+  const allDay=!!e.start.date;
+  e._c=c;
+  e._s=+(allDay?pYmd(e.start.date):new Date(e.start.dateTime));
+  e._e=+(allDay?pYmd((e.end&&e.end.date)||e.start.date):new Date((e.end&&e.end.dateTime)||e.start.dateTime));
+  if(isNaN(e._s))return;if(isNaN(e._e))e._e=e._s;
+  const key=c+':'+e.id;RAW.set(key,e);
+  if(/돌아보기\s*\(Claude\)/.test(e.summary||'')){EV.delete(key);parseReview(e);return}
+  EV.set(key,classify(e,c));
+}
+const evSig=list=>list.map(e=>e.id+'@'+(e.updated||'')).sort().join('|');
+/* 받아 온 구간을 통째로 갈아 끼운다. 달라진 게 없으면 false */
+function applyRun(c,from,to,items){
+  const a=+from,b=+to,live=items.filter(e=>e&&e.id&&e.status!=='cancelled'&&e.start),old=[];
+  for(const e of RAW.values()){if(e._c===c&&e._s<b&&e._e>a)old.push(e)}
+  if(evSig(old)===evSig(live))return false;
+  for(const e of old){const k=c+':'+e.id;RAW.delete(k);EV.delete(k)}
+  if(c==='p'){for(const k of Object.keys(REVCAL)){const d=+pYmd(k);if(d>=a&&d<b)delete REVCAL[k]}}
+  for(const e of live)ingest(e,c);
+  return true;
+}
+let evT=null,evDirty=false;
+function saveEventsSoon(changed){
+  if(changed)evDirty=true;if(evT)return;
+  evT=setTimeout(()=>{evT=null;if(evDirty){evDirty=false;DB.set('events',{v:1,items:[...RAW.values()]})}DB.set('fresh',FRESH)},1200);
+}
+async function fetchRun(c,months){
+  const from=mkDate(months[0]),to=mkDate(mkNext(months[months.length-1])),bk='ev'+c+months[0],first=months.some(k=>!FRESH[c][k]);
+  months.forEach(k=>{evBusy[c+k]=1});busy.add(bk);syncDot();
+  try{
+    let token=null,all=[],n=0;
+    do{
+      const input={startTime:ymd(from)+'T00:00:00',endTime:ymd(to)+'T00:00:00'};
+      if(c!=='p')input.calendarId=CFG.cal[c];
+      if(token)input.pageToken=token;
+      const p=await call(CFG.GC,'list_events',input);
+      all=all.concat((p&&p.events)||[]);token=p&&p.nextPageToken;n++;
+    }while(token&&n<6);
+    const ch=applyRun(c,from,to,all),now=Date.now();
+    months.forEach(k=>{FRESH[c][k]=now});lastSync=now;
+    ERRC[c]=null;saveEventsSoon(ch);
+    return ch||first;
+  }catch(e){
+    const show=e.code!=='auth'&&!(e.code==='network'&&months.every(k=>FRESH[c][k]));
+    ERRC[c]=show?e:null;
+    return show;
+  }finally{
+    ERR.gc=ERRC.p||ERRC.f||ERRC.h;
+    months.forEach(k=>{delete evBusy[c+k]});busy.delete(bk);syncDot();
+  }
+}
+/* need: {p:[달…],f:[…],h:[…]}. 붙어 있는 달은 한 번의 요청으로 묶는다.
+   force=true면 내 일정·가족 일정을 바로 다시 받고, 'all'이면 공휴일까지 다시 받는다 */
+function syncEvents(need,force){
+  const jobs=[],now=Date.now();
+  for(const c of ['p','f','h']){
+    const f=c==='h'?force==='all':!!force;
+    const all=[...new Set(need[c]||[])].sort(),st=all.filter(k=>!evBusy[c+k]&&(f||!(FRESH[c][k]&&now-FRESH[c][k]<EV_TTL[c])));
+    if(!st.length)continue;
+    // 오래된 달 사이에 낀 달은 함께 받아 요청 수를 줄인다
+    const ms=all.filter(k=>k>=st[0]&&k<=st[st.length-1]&&!evBusy[c+k]);
+    let run=[ms[0]];
+    for(let i=1;i<ms.length;i++){if(mkNext(run[run.length-1])===ms[i])run.push(ms[i]);else{jobs.push(fetchRun(c,run));run=[ms[i]]}}
+    jobs.push(fetchRun(c,run));
+  }
+  if(jobs.length)Promise.all(jobs).then(rs=>{if(rs.some(Boolean))render()});
+}
+function viewNeeds(){
+  const v=S.view,c=S.cur,n={p:[],f:[],h:[]};
+  if(v==='year')n.h=monthsOf(new Date(c.getFullYear(),0,1),new Date(c.getFullYear()+1,0,1));
+  else if(v==='month'){const ms=mStart(c),gs=wkStart(ms),ge=addD(gs,42),pm=new Date(ms.getFullYear(),ms.getMonth()-1,1);n.p=n.f=monthsOf(pm,ge);n.h=monthsOf(gs,ge)}
+  else if(v==='week'||v==='day'){const ws=wkStart(c);n.p=n.f=n.h=monthsOf(ws,addD(ws,7))}
+  return n;
+}
+/* 기기에 저장해 둔 일정·기록을 읽어 온다(앱을 열자마자 화면을 그리기 위해) */
+async function cacheLoad(){
+  const [ev,fr,tb]=await Promise.all([DB.get('events'),DB.get('fresh'),DB.get('tables')]);
+  if(ev&&ev.v===1&&Array.isArray(ev.items)&&fr){
+    const now=Date.now();
+    for(const c of ['p','f','h']){for(const k in (fr[c]||{})){if(now-fr[c][k]<200*864e5)FRESH[c][k]=fr[c][k]}}
+    for(const e of ev.items){
+      if(!e||!FRESH[e._c]||isNaN(e._s))continue;
+      if(!monthsOf(new Date(e._s),new Date(Math.max(e._e,e._s+1))).some(k=>FRESH[e._c][k]))continue;   // 오래전에 받아 둔 달의 일정은 버린다
+      ingest(e,e._c);
+    }
+  }
+  if(tb&&tb.v===1&&tb.tabs&&(!SHEET_ID||tb.sheet===SHEET_ID)){
+    for(const ds in tb.tabs){if(STAB[ds]&&tb.tabs[ds]&&Array.isArray(tb.tabs[ds].rows))TBL[ds]=tb.tabs[ds]}
+    Object.assign(CONF,tb.conf||{});tblSig=tb.sig||0;applyConf();
+  }
 }
 function evOn(day){
   const a=+day,b=+addD(day,1);
@@ -520,15 +820,18 @@ function holidayOn(day){return evOn(day).filter(e=>e.cal==='h')}
 function evArea(e){return e.cal==='h'?'휴일':e.cal==='f'?'가족':e.area}
 function aCls(a){return 'a-'+(AK[a]||'p')}
 
-/* ---------- 노션 ---------- */
-const dF=(p,op,v)=>({type:'property',property:p,propertyType:'date',operator:op,value:{type:'exact',value:v}});
-async function loadRows(key,fn,force){
-  if(!force&&R[key])return;if(busy.has(key))return;
-  busy.add(key);syncDot();
-  try{R[key]=await fn();ERR.no=null;afterRows(key)}catch(e){ERR.no=e}
-  finally{busy.delete(key);syncDot();render()}
+/* ---------- 기록 조회(시트에서 받아 둔 표에서 뽑는다) ---------- */
+const rowsOf=ds=>(TBL[ds]&&TBL[ds].rows)||[];
+const dF=(p,op,v)=>({property:p,operator:op,value:v});
+function qRows(ds,filters,sort){
+  let rows=rowsOf(ds).slice();
+  for(const f of (filters||[])){const k='date:'+f.property+':start',v=f.value;rows=rows.filter(r=>{const x=String(r[k]||'').slice(0,10);if(!x)return false;
+    switch(f.operator){case 'date_is':return x===v;case 'date_is_on_or_after':return x>=v;case 'date_is_before':return x<v;default:return true}})}
+  if(sort){const k='date:'+sort[0]+':start',dr=sort[1]==='desc'?-1:1;rows.sort((a,b)=>String(a[k]||'').localeCompare(String(b[k]||''))*dr)}
+  return rows;
 }
-function dropRows(prefix){for(const k of Object.keys(R))if(k.startsWith(prefix))delete R[k]}
+function loadRows(key,ds,filters,sort){if(R[key]||!TBL[ds])return;R[key]=qRows(ds,filters,sort);afterRows(key)}
+function dropRows(prefix){for(const k of Object.keys(R))if(!prefix||k.startsWith(prefix))delete R[k]}
 function afterRows(key){
   if(key.startsWith('daily:')){
     for(const r of R[key]){
@@ -541,35 +844,39 @@ function afterRows(key){
 }
 function dDraft(d){if(!drafts.daily[d])drafts.daily[d]={id:'',f:{done:'',todo:'',improve:'',memo:''},habits:[],dirty:false,loaded:false};return drafts.daily[d]}
 const keyWeek=ws=>ymd(ws)+'~'+ymd(addD(ws,7));
-function qDaily(ws){return loadRows('daily:'+keyWeek(ws),()=>nQuery(CFG.ds.daily,[dF('날짜','date_is_on_or_after',ymd(ws)),dF('날짜','date_is_before',ymd(addD(ws,7)))],[{property:'날짜',direction:'ascending'}]))}
-function qMeetRange(from,to){return loadRows('meet:'+ymd(from)+'~'+ymd(to),()=>nQuery(CFG.ds.meet,[dF('일시','date_is_on_or_after',ymd(from)),dF('일시','date_is_before',ymd(to))],[{property:'일시',direction:'ascending'}]))}
-function qGoals(kind,start){return loadRows('goal:'+kind+':'+ymd(start),()=>nQuery(CFG.ds.goal,[dF('시작일','date_is',ymd(start))]))}
-function qMeetList(){const t=today();return loadRows('meet:list',()=>nQuery(CFG.ds.meet,[dF('일시','date_is_on_or_after',ymd(addD(t,-120))),dF('일시','date_is_before',ymd(addD(t,90)))],[{property:'일시',direction:'descending'}]))}
-function qIdeas(){return loadRows('idea:list',()=>nQuery(CFG.ds.idea,null,[{property:'작성일',direction:'descending'}]))}
+function qDaily(ws){loadRows('daily:'+keyWeek(ws),'daily',[dF('날짜','date_is_on_or_after',ymd(ws)),dF('날짜','date_is_before',ymd(addD(ws,7)))],['날짜','asc'])}
+function qMeetRange(from,to){loadRows('meet:'+ymd(from)+'~'+ymd(to),'meet',[dF('일시','date_is_on_or_after',ymd(from)),dF('일시','date_is_before',ymd(to))],['일시','asc'])}
+function qGoals(kind,start){loadRows('goal:'+kind+':'+ymd(start),'goal',[dF('시작일','date_is',ymd(start))])}
+function qMeetList(){const t=today();loadRows('meet:list','meet',[dF('일시','date_is_on_or_after',ymd(addD(t,-120))),dF('일시','date_is_before',ymd(addD(t,90)))],['일시','desc'])}
+function qIdeas(){loadRows('idea:list','idea',null,['작성일','desc'])}
 function meetDate(r){return pDT(r['date:일시:start'])}
-function meetsOn(day){const out=[];for(const k in R){if(!k.startsWith('meet:'))continue;for(const r of R[k]){const d=meetDate(r);if(d&&same(d,day)&&!out.some(x=>rowId(x)===rowId(r)))out.push(r)}}return out.sort((a,b)=>meetDate(a)-meetDate(b))}
-function meetsIn(from,to){const out=[];for(const k in R){if(!k.startsWith('meet:'))continue;for(const r of R[k]){const d=meetDate(r);if(d&&d>=from&&d<to&&!out.some(x=>rowId(x)===rowId(r)))out.push(r)}}return out.sort((a,b)=>meetDate(a)-meetDate(b))}
+const byMeet=(a,b)=>meetDate(a)-meetDate(b);
+function meetsOn(day){return rowsOf('meet').filter(r=>{const d=meetDate(r);return d&&same(d,day)}).sort(byMeet)}
+function meetsIn(from,to){return rowsOf('meet').filter(r=>{const d=meetDate(r);return d&&d>=from&&d<to}).sort(byMeet)}
 
 /* ---------- 데이터 확보 ---------- */
-function ensure(force){
-  if(!mcp)return;
+/* 지금 화면에 필요한 기록을 저장본에서 뽑는다(그릴 때마다 호출, 이미 뽑았으면 건너뜀) */
+function derive(){
   const v=S.view,c=S.cur;
-  if(v==='year'){const y=new Date(c.getFullYear(),0,1);loadEvents(y,new Date(c.getFullYear()+1,0,1),['h'],force)}
-  else if(v==='month'){const ms=mStart(c),gs=wkStart(ms),ge=addD(gs,42),pm=new Date(ms.getFullYear(),ms.getMonth()-1,1);loadEvents(gs,ge,null,force);loadEvents(pm,ms,['p','f'],force);qMeetRange(ms,new Date(ms.getFullYear(),ms.getMonth()+1,1))}
-  else if(v==='week'||v==='day'){const ws=wkStart(c);loadEvents(ws,addD(ws,7),null,force);qDaily(ws);qMeetRange(ws,addD(ws,7));if(v==='week')qGoals('주간',ws);else qDaily(wkStart(addD(c,-1)))}
-  else if(v==='meet'){qMeetList()}
-  else if(v==='idea'){qIdeas()}
+  if(v==='month'){const ms=mStart(c);qMeetRange(ms,new Date(ms.getFullYear(),ms.getMonth()+1,1))}
+  else if(v==='week'||v==='day'){const ws=wkStart(c);qDaily(ws);qMeetRange(ws,addD(ws,7));if(v==='week')qGoals('주간',ws);else qDaily(wkStart(addD(c,-1)))}
+  else if(v==='meet')qMeetList();
+  else if(v==='idea')qIdeas();
+}
+/* 구글에서 새로 받아 온다. 받은 내용이 저장본과 다를 때만 화면을 다시 그린다 */
+function ensure(force){
+  if(!LS.get('hadLogin')||!navigator.onLine||AUTH.st==='need'||AUTH.st==='none')return;
+  syncEvents(viewNeeds(),force);
+  syncTables(!!force);
 }
 function refreshAll(){
-  for(const c in covered)covered[c]=[];
-  for(const k of Object.keys(R))delete R[k];
-  ERR.gc=ERR.no=null;
-  if(mcp&&mcp.invalidate)mcp.invalidate(CFG.GC).catch(()=>{});
-  ensure(true);render();
+  ERR.gc=ERR.no=null;ERRC.p=ERRC.f=ERRC.h=null;
+  if(AUTH.st==='need'||AUTH.st==='off'){connect().then(ok=>{if(ok)ensure('all')});render();return}
+  ensure('all');render();
 }
 
 /* ---------- 화면 조각 ---------- */
-function loading(){return busy.size?'<span class="muted">불러오는 중…</span>':''}
+function loading(){if(busy.size&&(!TBL.daily||!RAW.size)){loadShown=true;return '<span class="muted">불러오는 중…</span>'}return ''}
 function evLine(e,big){
   const a=evArea(e),cls='a-'+(AK[a]||'p');
   const t=e.allDay?'종일':big?hm(e.start)+'–'+hm(e.end):hm(e.start);
@@ -577,10 +884,13 @@ function evLine(e,big){
   return '<div class="ev '+(big?'big ':'')+cls+'" data-act="ev" data-k="'+esc(e.key)+'"><span class="bar"></span><span class="t">'+t+'</span>'+tag+
     '<span class="x">'+esc(e.title)+(big&&e.loc?'<span class="loc">'+esc(e.loc)+'</span>':'')+'</span></div>';
 }
-function noMcpNote(){
-  if(mcpState==='login')return '<div class="note">구글 계정으로 로그인하면 캘린더와 기록을 불러옵니다.<button class="btn sm primary" data-act="login">구글 로그인</button></div>';
-  if(mcpState==='wait')return '<div class="note">연동 준비 중…</div>';
-  return '';
+function authNote(){
+  switch(AUTH.st){
+    case 'none':return '<div class="note">구글 계정으로 로그인하면 캘린더와 기록을 불러옵니다.<button class="btn sm primary" data-act="login">구글 로그인</button></div>';
+    case 'need':return '<div class="note">구글 연결이 끊겨, 저장해 둔 내용을 보여 드립니다.<button class="btn sm primary" data-act="login">다시 연결</button></div>';
+    case 'off':return '<div class="note">오프라인입니다. 저장해 둔 내용을 보여 드립니다.</div>';
+    default:return '';
+  }
 }
 function head(title,sub){return '<div class="ph"><h2>'+title+'</h2><span class="sub">'+(sub||'')+'</span></div>'}
 
@@ -595,7 +905,7 @@ function miniMonth(y,m){
 }
 function vYear(){
   const y=S.cur.getFullYear();
-  let L=head(y+'년','1월 – 6월')+'<div class="body">'+noMcpNote()+'<div class="yr">';
+  let L=head(y+'년','1월 – 6월')+'<div class="body">'+authNote()+'<div class="yr">';
   for(let m=0;m<6;m++)L+=miniMonth(y,m);
   L+='</div></div>';
   let Rr=head('&nbsp;','7월 – 12월')+'<div class="body"><div class="yr">';
@@ -624,7 +934,7 @@ function vMonth(){
     g+=c+'</div>';
   }
   g+='</div>';
-  const L=head(y+'. '+(m+1)+'월','<span class="row" style="gap:8px">'+AREAS.map(a=>'<span class="row '+aCls(a)+'" style="gap:3px"><span class="dot"></span>'+a+'</span>').join('')+'</span>')+'<div class="body">'+noMcpNote()+errNote('gc')+g+'</div>';
+  const L=head(y+'. '+(m+1)+'월','<span class="row" style="gap:8px">'+AREAS.map(a=>'<span class="row '+aCls(a)+'" style="gap:3px"><span class="dot"></span>'+a+'</span>').join('')+'</span>')+'<div class="body">'+authNote()+errNote('gc')+g+'</div>';
   return [L,vReview(ms)];
 }
 /* 돌아보기 */
@@ -651,7 +961,7 @@ function monthStats(ms,upto){
   let nx=addD(t,1);while(nx.getDay()===0||nx.getDay()===6)nx=addD(nx,1);
   return {ms,cut,current:t>=ms&&t<me,days,A,kakao,dl,guess,wd,ex,golf,people,nx:ymd(nx),total:past.length};
 }
-function prevCovered(ms){const pm=new Date(ms.getFullYear(),ms.getMonth()-1,1);return isCovered('p',+pm,+ms)}
+function prevCovered(ms){return !!FRESH.p[mk(new Date(ms.getFullYear(),ms.getMonth()-1,1))]}
 const REV={};
 function vReview(ms){
   const st=monthStats(ms),m=ms.getMonth()+1;
@@ -659,7 +969,7 @@ function vReview(ms){
   const fut=ms>today();
   let h=head(m+'월 돌아보기',fut?'아직 오지 않은 달':st.current?md(addD(st.cut,-1))+'까지':'')+'<div class="body">'+errNote('gc');
   if(fut){return h+'<div class="empty">이 달이 지나면 활동을 정리해 드립니다.</div></div>'}
-  if(!st.total){return h+(busy.size?loading():'<div class="muted">이 달의 일정이 없습니다.</div>')+claudeBlock(ms)+'</div>'}
+  if(!st.total){return h+(loading()||'<div class="muted">이 달의 일정이 없습니다.</div>')+claudeBlock(ms)+'</div>'}
   h+='<h3 class="sec">무엇을 했나<small>'+(pst?'▲▼ '+(pm.getMonth()+1)+'월 '+(st.current?'같은 기간 ':'')+'대비':'')+'</small></h3>';
   for(const a of AREAS){const x=st.A[a],ac=Object.entries(x.acts).sort((p,q)=>q[1]-p[1]).slice(0,5);
     let dlt='';if(pst){const dv=x.n-pst.A[a].n;dlt=dv?' '+(dv>0?'▲':'▼')+Math.abs(dv):''}
@@ -730,14 +1040,14 @@ function vWeek(){
     w+='</div></div>';
   }
   w+='</div>';
-  const L=head(lb.m+'월 '+lb.n+'주',md(ws)+' – '+md(we))+'<div class="body">'+noMcpNote()+errNote('gc')+w+'</div>';
+  const L=head(lb.m+'월 '+lb.n+'주',md(ws)+' – '+md(we))+'<div class="body">'+authNote()+errNote('gc')+w+'</div>';
   return [L,weekPrep(ws)];
 }
 function weekPrep(ws){
   const t=today(),we=addD(ws,7),curWk=same(wkStart(t),ws),past=we<=t;
   const list=[...EV.values()].filter(e=>e.cal!=='h'&&e.start<we&&e.end>ws).sort((a,b)=>a.start-b.start);
   let h=head(past?'지난 주':'이번 주 준비',loading())+'<div class="body">'+errNote('no');
-  if(!mcp)return h+'<div class="muted">로그인하면 이번 주 마감·흐름·리듬을 정리해 드립니다.</div></div>';
+  if(AUTH.st==='none')return h+'<div class="muted">로그인하면 이번 주 마감·흐름·리듬을 정리해 드립니다.</div></div>';
   // 놓치면 안 되는 것
   const must=list.filter(e=>e.cal==='p'&&!e.done&&e.tag!=='카톡'&&(e.act==='마감'||e.act==='출장'||(e.allDay&&isWork(e)&&e.act!=='금융')));
   const kOpen=list.filter(e=>e.tag==='카톡'&&!e.done);
@@ -770,7 +1080,7 @@ function weekPrep(ws){
   h+='<h3 class="sec">미팅 준비<small>'+meets.length+'건</small></h3>';
   if(!meets.length)h+='<div class="muted">잡힌 미팅이 없습니다.</div>';
   for(const e of meets){
-    let has=false;for(const k in R){if(k.startsWith('meet:')&&R[k].some(r=>calRefPart(r['캘린더ID'],'원본')===e.id)){has=true;break}}
+    const has=rowsOf('meet').some(r=>calRefPart(r['캘린더ID'],'원본')===e.id);
     h+='<div class="tdr '+aCls(e.area)+'"><span class="dd">'+md(e.start)+'('+DOW[e.start.getDay()]+')</span><span class="dot"></span><span class="x" data-act="ev" data-k="'+esc(e.key)+'">'+(e.allDay?'':hm(e.start)+' ')+esc(e.title)+'</span><button class="btn sm" data-act="evmeet" data-k="'+esc(e.key)+'">'+(has?'기록 보기':'준비 메모')+'</button></div>';
   }
   // 목표
@@ -823,7 +1133,7 @@ function vDay(){
     if(nx)nl+=(nl?'<br>':'')+'다음 <b>'+hm(new Date(nx.s))+' '+esc(nx.e.title)+'</b> · '+fmtDur((nx.s-now)/60000)+' 후';
     if(!nl)nl='오늘 남은 일정이 없습니다.'}
   let L=head(d.getDate()+'일 '+DOW[d.getDay()]+'요일',d.getFullYear()+'. '+(d.getMonth()+1)+'월'+(hol.length?' · <span style="color:var(--h)">'+esc(hol[0].title)+'</span>':'')+' <button class="btn sm" data-act="newev" data-d="'+ds+'">+ 일정</button>');
-  L+=noMcpNote()+errNote('gc');
+  L+=authNote()+errNote('gc');
   if(nl)L+='<div class="nextline">'+nl+'</div>';
   if(alld.length)L+='<div class="alld">'+alld.map(e=>'<span class="ev '+aCls(evArea(e))+'" data-act="ev" data-k="'+esc(e.key)+'"><span class="bar"></span><span class="x">'+(e.done?'✔ ':'')+esc(e.title)+'</span></span>').join('')+'</div>';
   L+='<div class="body" data-scroll="'+Math.max(0,Math.round(scrollTo-60))+'" data-ak="'+ds+'|'+tm.length+'|'+H0+'">'+tl+'</div>';
@@ -851,9 +1161,9 @@ function vDay(){
 function vMeet(){
   const rows=R['meet:list']||[],f=S.meetF;
   const list=rows.filter(r=>f==='전체'||r['영역']===f);
-  let L=head('미팅 · 상담','최근 4개월 · 예정 3개월')+'<div class="body">'+noMcpNote()+errNote('no');
+  let L=head('미팅 · 상담','최근 4개월 · 예정 3개월')+'<div class="body">'+authNote()+errNote('no');
   L+='<div class="chips">'+['전체',...AREAS].map(a=>'<button class="chip'+(a!=='전체'?' area a-'+AK[a]:'')+(f===a?' on':'')+'" data-act="meetf" data-a="'+a+'">'+a+'</button>').join('')+'<span class="spacer"></span><button class="btn sm" data-act="meetnew">+ 새 기록</button></div>';
-  if(!rows.length&&busy.size)L+=loading();
+  if(!rows.length&&loading())L+=loading();
   else if(!list.length)L+='<div class="muted">기록이 없습니다.</div>';
   let lastG='';const sel=drafts.meet&&drafts.meet.id;
   for(const r of list){const d=meetDate(r),g=d?d.getFullYear()+'. '+(d.getMonth()+1)+'월':'날짜 없음';if(g!==lastG){L+='<div class="grp">'+g+'</div>';lastG=g}
@@ -886,9 +1196,9 @@ function setCalRef(s,kind,id){s=String(s||'').replace(new RegExp('\\s*/?\\s*'+ki
 /* 구상 */
 function vIdea(){
   const rows=R['idea:list']||[],f=S.ideaF,list=rows.filter(r=>f==='전체'||r['영역']===f);
-  let L=head('구상 노트','')+'<div class="body">'+noMcpNote()+errNote('no');
+  let L=head('구상 노트','')+'<div class="body">'+authNote()+errNote('no');
   L+='<div class="chips">'+['전체',...AREAS].map(a=>'<button class="chip'+(a!=='전체'?' area a-'+AK[a]:'')+(f===a?' on':'')+'" data-act="ideaf" data-a="'+a+'">'+a+'</button>').join('')+'<span class="spacer"></span><button class="btn sm" data-act="ideanew">+ 새 구상</button></div>';
-  if(!rows.length&&busy.size)L+=loading();else if(!list.length)L+='<div class="muted">구상 노트가 없습니다.</div>';
+  if(!rows.length&&loading())L+=loading();else if(!list.length)L+='<div class="muted">구상 노트가 없습니다.</div>';
   const sel=drafts.idea&&drafts.idea.id;
   for(const r of list){const d=pDT(r['date:작성일:start']);
     L+='<div class="li'+(sel===rowId(r)?' sel':'')+'" data-act="ideaopen" data-id="'+rowId(r)+'"><span class="d">'+(d?md(d):'')+'</span><span class="dot a-'+(AK[r['영역']]||'p')+'"></span><span class="x">'+esc(r['제목']||'(제목 없음)')+'</span><span class="w">'+esc(r['상태']||'')+'</span></div>'}
@@ -916,11 +1226,20 @@ function vSet(){
   L+='<div style="margin-top:6px">말머리가 없는 예전 일정은 단어와 색으로 추정합니다. 일정을 눌러 영역과 활동을 고르면 캘린더 제목도 함께 고쳐집니다. 처리한 마감·회신은 완료 표시(✔)를 해 두면 돌아보기에 반영됩니다.</div></div>';
   L+='</div>';
   let Rr=head('연결','')+'<div class="body">';
-  const st=(e)=>e?'<span style="color:var(--h)">'+esc(errMsg(e,e===ERR.gc?CFG.GC:CFG.NO))+'</span>':(mcp?'<span style="color:var(--d)">연결됨</span>':'<span class="muted">로그인 필요</span>');
-  Rr+='<h3 class="sec">상태</h3><div class="fld"><label>캘린더</label><span style="font-size:12.5px">'+st(ERR.gc)+'</span></div><div class="fld"><label>기록</label><span style="font-size:12.5px">'+st(ERR.no)+'</span></div>';
-  Rr+='<div class="row" style="margin-top:8px">'+(mcp?'<button class="btn" data-act="refresh">모두 새로 불러오기</button><button class="btn" data-act="logout">로그아웃</button>':'<button class="btn primary" data-act="login">구글 로그인</button>')+'</div>';
+  const A={ok:['var(--d)','연결됨'],renew:['var(--ink2)','연결 확인 중'],need:['var(--h)','다시 연결 필요'],off:['var(--ink2)','오프라인'],none:['var(--ink3)','로그인 전']}[AUTH.st];
+  const mode={frame:'자동 연장',redirect:'자동 연장(잠깐 다녀오는 방식)'}[LS.get('silentMode')]||'';
+  const had=LS.get('hadLogin'),hint=LS.get('hint'),fld=(l,v)=>'<div class="fld"><label>'+l+'</label><span style="font-size:12.5px">'+v+'</span></div>';
+  const es=e=>e?'<span style="color:var(--h)">'+esc(errMsg(e,e===ERR.no?CFG.NO:CFG.GC))+'</span>':'정상';
+  Rr+='<h3 class="sec">상태</h3>'+fld('구글','<span style="color:'+A[0]+'">'+A[1]+'</span>'+(AUTH.st==='ok'&&mode?' · '+mode:'')+(AUTH.st==='need'&&AUTH.err?' <span class="muted">'+esc(AUTH.err)+'</span>':''));
+  if(hint)Rr+=fld('계정',esc(maskMail(hint)));
+  if(had)Rr+=fld('캘린더',es(ERR.gc))+fld('기록',es(ERR.no))+(lastSync?fld('최근 확인',hm(new Date(lastSync))):'');
+  Rr+='<div class="row" style="margin-top:8px">'+(had?(AUTH.st==='need'?'<button class="btn primary" data-act="login">다시 연결</button>':'')+'<button class="btn" data-act="refresh">모두 새로 불러오기</button><button class="btn" data-act="logout">로그아웃</button>':'<button class="btn primary" data-act="login">구글 로그인</button>')+'</div>';
+  if(had)Rr+='<div class="muted" style="margin-top:6px;line-height:1.7">다른 구글 계정으로 바꾸려면 로그아웃한 뒤 다시 로그인하세요.</div>';
+  const lg=(LS.get('authLog')||[]).slice(-4).reverse();
+  if(lg.length)Rr+='<h3 class="sec">연결 기록</h3><div class="muted" style="line-height:1.8">'+lg.map(x=>{const d=new Date(x[0]);return md(d)+' '+hm(d)+' · '+({login:'직접 로그인',frame:'자동 연장',redirect:'자동 연장(다녀옴)'}[x[1]]||esc(x[1]))+' '+(x[2]==='ok'?'성공':'실패 '+esc(x[2]))+(x[3]>1?' ×'+x[3]:'')}).join('<br>')+'</div>';
   Rr+='<h3 class="sec">기록 시트</h3><div style="font-size:12.5px;line-height:1.8">'+(SHEET_ID?'<a href="https://docs.google.com/spreadsheets/d/'+SHEET_ID+'" target="_blank" rel="noopener" style="color:var(--ink)">「'+CFG.sheetTitle+'」 열기</a><br>':'')+'<span class="muted">미팅·구상·데일리·목표 기록이 구글 시트에 저장됩니다. 첫 줄 제목은 바꾸지 마세요.</span></div>';
   Rr+='<h3 class="sec">화면</h3><div class="muted" style="line-height:1.8">펼친 화면에서는 양면, 접은 화면에서는 한 면씩 보입니다. 좌우로 밀거나 아래 모서리 화살표로 넘기세요. 현재: '+(S.mode==='spread'?'양면':'한 면')+'</div>';
+  Rr+='<div class="muted" style="margin-top:10px;line-height:1.8">버전 '+APP_VER+' ('+BUILD+')'+(UPD?' · 새 버전이 준비됐습니다 <button class="btn sm" data-act="applyupd">지금 적용</button>':'')+'</div>';
   Rr+='</div>';
   return [L,Rr];
 }
@@ -955,6 +1274,7 @@ function restoreFocus(o,sameView){
   if(o.bind){const el=pagesEl.querySelector('[data-bind="'+CSS.escape(o.bind)+'"]');if(el){el.focus({preventScroll:true});try{if(o.s!=null)el.setSelectionRange(o.s,o.e)}catch(e){}}}
 }
 function render(){
+  derive();
   const vk=S.view+'|'+ymd(S.cur)+'|'+S.mode+'|'+S.page;
   const f=saveFocus(),sameView=vk===lastViewKey;lastViewKey=vk;
   const [L,Rr]=spread();
@@ -1087,12 +1407,13 @@ async function act(a,ds,el){
   case 'listsheet':listSheet(ds.kind);break;
   case 'sugev':newEvSheet(ds.d||ymd(addD(today(),1)),ds.a,ds.c||'',ds.s,ds.e);break;
   case 'login':startAuth(false);break;
-  case 'logout':LS.del('token');LS.del('hadLogin');mcp=null;mcpState='login';render();toast('로그아웃했습니다');break;
+  case 'logout':doLogout();break;
+  case 'applyupd':persistState();location.reload();break;
   case 'evact':await evSetArea(ds.k,ds.a,ds.c);break;
   case 'evdone':await evDone(ds.k,ds.keep==='1');break;
   case 'neact':readNE();NE.act=NE.act===ds.c?'':ds.c;drawNewEv();break;
   case 'ev':evSheet(ds.k);break;
-  case 'retry':ERR.gc=ERR.no=null;for(const c in covered)covered[c]=[];for(const k of Object.keys(R))delete R[k];ensure(true);render();break;
+  case 'retry':ERR.gc=ERR.no=null;ERRC.p=ERRC.f=ERRC.h=null;ensure(true);render();break;
   case 'refresh':refreshAll();toast('다시 불러오는 중입니다');break;
   case 'close':closeSheet();break;
   case 'confirm-yes':{const y=sheetCtx&&sheetCtx.yes;closeSheet();if(y)y();break}
@@ -1123,7 +1444,7 @@ async function act(a,ds,el){
   case 'hadd':{const n=HN.name.trim();if(!n){toast('습관 이름을 적어 주세요');return}if(habits.some(h=>h.name===n)){toast('이미 있는 습관입니다');return}habits.push({name:n,n:+HN.n||3});HN.name='';await saveHabits();render();break}
   }
 }
-function findRow(prefix,id){for(const k in R){if(!k.startsWith(prefix))continue;const r=R[k].find(x=>rowId(x)===id);if(r)return r}return null}
+function findRow(prefix,id){return rowsOf(prefix.replace(/:$/,'')).find(x=>rowId(x)===id)||null}
 function guardMeet(fn){if(drafts.meet&&drafts.meet.dirty)confirmSheet('저장하지 않은 미팅 기록이 있습니다. 버리고 진행할까요?',fn);else fn()}
 function guardIdea(fn){if(drafts.idea&&drafts.idea.dirty)confirmSheet('저장하지 않은 구상 노트가 있습니다. 버리고 진행할까요?',fn);else fn()}
 function toMeetEditor(){if(S.view!=='meet')go('meet',null,S.mode==='single'?1:0);else if(S.mode==='single'&&S.page===0)flipTo(()=>{S.page=1},1);else render()}
@@ -1135,7 +1456,7 @@ function meetFromRow(r){
 }
 function openMeetFromEvent(e){
   guardMeet(()=>{
-    let ex=null;for(const k in R){if(!k.startsWith('meet:'))continue;ex=R[k].find(r=>calRefPart(r['캘린더ID'],'원본')===e.id);if(ex)break}
+    const ex=rowsOf('meet').find(r=>calRefPart(r['캘린더ID'],'원본')===e.id);
     if(ex)drafts.meet=meetFromRow(ex);
     else{const m=newMeet(ymd(e.start));m.f.title=e.title;m.f.time=e.allDay?'':hm(e.start);m.f.area=AREAS.includes(e.area)?e.area:'개인';m.f.place=e.loc;m.f.calRef='원본:'+e.id;m.dirty=true;drafts.meet=m}
     toMeetEditor();
@@ -1143,25 +1464,32 @@ function openMeetFromEvent(e){
 }
 
 /* ---------- 저장 ---------- */
-function writeErr(e,server){const msg=errMsg(e,server);toast(msg);if(e&&(e.code==='server_unavailable'||e.code==='upstream_error'))toast('저장 여부가 확실하지 않습니다. 노션이나 캘린더에서 확인해 주세요.')}
+function writeErr(e,server){toast(errMsg(e,server)+(e&&e.status>=500?' 저장됐는지 잠시 뒤 확인해 주세요.':''))}
+/* 캘린더에 쓴 내용은 저장본에도 바로 반영한다(전체를 다시 받아 오지 않는다) */
+function patchLocal(k,resp,summary){
+  const raw=RAW.get(k);if(!raw)return;
+  if(resp&&resp.id){for(const f of ['status','summary','description','location','htmlLink','colorId','start','end','updated'])if(resp[f]!==undefined)raw[f]=resp[f]}
+  else raw.summary=summary;
+  ingest(raw,raw._c);saveEventsSoon(true);
+}
+function addLocal(resp){if(resp&&resp.id&&resp.start){ingest(resp,'p');saveEventsSoon(true);return true}return false}
 async function evSetArea(k,area,act,keep){
   const e=EV.get(k);if(!e)return;
   if(act==null)act=(ACTS[area]||[]).includes(e.act)?e.act:'';
   if(e.area===area&&e.explicit&&e.act===act){if(!keep)closeSheet();return}
   const summary=buildSummary(e,area,act);
-  try{await call(CFG.GC,'update_event',{eventId:e.id,summary,notificationLevel:'NONE'});
-    e.area=area;e.act=act;e.explicit=true;e.raw=summary;
-    if(mcp.invalidate)mcp.invalidate(CFG.GC,'list_events').catch(()=>{});
+  try{const r=await call(CFG.GC,'update_event',{eventId:e.id,summary});
+    patchLocal(k,r,summary);
     toast(area+(act?'·'+act:'')+' 일정으로 바꿨습니다');
-    if(keep&&sheetCtx&&sheetCtx.list)listSheet(sheetCtx.list);else if(!keep&&sheetCtx==null)evSheet(k);else evSheet(k);
+    if(keep&&sheetCtx&&sheetCtx.list)listSheet(sheetCtx.list);else evSheet(k);
     render();
   }catch(err){writeErr(err,CFG.GC)}
 }
 async function evDone(k,keep){
   const e=EV.get(k);if(!e||e.done)return;
   const summary='✔'+e.raw.replace(/^✔\s*/,'');
-  try{await call(CFG.GC,'update_event',{eventId:e.id,summary,notificationLevel:'NONE'});
-    e.done=true;e.raw=summary;if(mcp.invalidate)mcp.invalidate(CFG.GC,'list_events').catch(()=>{});
+  try{const r=await call(CFG.GC,'update_event',{eventId:e.id,summary});
+    patchLocal(k,r,summary);
     toast('완료 표시를 했습니다');
     if(keep&&sheetCtx&&sheetCtx.list)listSheet(sheetCtx.list);else closeSheet();
     render();
@@ -1176,18 +1504,20 @@ async function saveNewEv(){
   if(NE.allDay){input.startTime=NE.date+'T00:00:00';input.endTime=ymd(addD(pYmd(NE.date),1))+'T00:00:00';input.allDay=true}
   else{if(!NE.s||!NE.e||NE.e<=NE.s)return fail('종료 시간이 시작보다 늦어야 합니다.');input.startTime=NE.date+'T'+NE.s+':00';input.endTime=NE.date+'T'+NE.e+':00'}
   const btn=sheet.querySelector('[data-act="nesave"]');if(btn){btn.disabled=true;btn.textContent='저장 중…'}
-  try{await call(CFG.GC,'create_event',input);closeSheet();toast('캘린더에 저장했습니다');
-    covered.p=[];if(mcp.invalidate)await mcp.invalidate(CFG.GC,'list_events').catch(()=>{});ensure(true);
+  try{const r=await call(CFG.GC,'create_event',input);const local=addLocal(r);
+    closeSheet();toast('캘린더에 저장했습니다');render();
+    if(!local)ensure(true);
   }catch(e){if(btn){btn.disabled=false;btn.textContent='저장'}fail(errMsg(e,CFG.GC))}
 }
 async function toggleGoal(id,on){
   const r=findRow('goal:',id);if(r)r['완료']=on?'__YES__':'__NO__';render();
-  try{await nUpdate(id,{'완료':on?'__YES__':'__NO__'})}catch(e){if(r)r['완료']=on?'__NO__':'__YES__';render();writeErr(e,CFG.NO)}
+  try{await nUpdate(id,{'완료':on?'__YES__':'__NO__'},'goal')}
+  catch(e){if(r)r['완료']=on?'__NO__':'__YES__';tblSig=0;render();writeErr(e,CFG.NO)}
 }
 async function addGoal(kind,d){
   const t=(G.text[kind]||'').trim();if(!t){toast('목표를 적어 주세요');return}
-  try{const id=await nCreate(CFG.ds.goal,{'제목':t,'구분':kind,'date:시작일:start':d,'date:시작일:is_datetime':0,'영역':G.area,'완료':'__NO__'});
-    G.text[kind]='';const key='goal:'+kind+':'+d;(R[key]=R[key]||[]).push({'제목':t,'구분':kind,'영역':G.area,'완료':'__NO__','date:시작일:start':d,url:id});render();
+  try{await nCreate(CFG.ds.goal,{'제목':t,'구분':kind,'date:시작일:start':d,'date:시작일:is_datetime':0,'영역':G.area,'완료':'__NO__'});
+    G.text[kind]='';render();
   }catch(e){writeErr(e,CFG.NO)}
 }
 async function saveDaily(d){
@@ -1196,10 +1526,13 @@ async function saveDaily(d){
   const props={'제목':d+' ('+DOW[dt.getDay()]+')','date:날짜:start':d,'date:날짜:is_datetime':0,'처리한 일':dr.f.done,'미결·내일 할 일':dr.f.todo,'개선할 점':dr.f.improve,'메모':dr.f.memo,'완료 습관':dr.habits};
   dr.saving=true;render();
   try{
-    if(dr.id)await nUpdate(dr.id,props);else dr.id=await nCreate(CFG.ds.daily,props);
+    if(!TBL.daily)await syncTables(true);
+    // 같은 날짜의 줄이 이미 있으면 그 줄을 고친다(중복 방지)
+    if(!dr.id||!rowsOf('daily').some(x=>x.id===dr.id)){const ex=rowsOf('daily').find(r=>txt(r['date:날짜:start']).slice(0,10)===d);dr.id=ex?rowId(ex):''}
+    if(dr.id)await nUpdate(dr.id,props,'daily');else dr.id=await nCreate(CFG.ds.daily,props);
     dr.dirty=false;toast('저장했습니다');
   }catch(e){writeErr(e,CFG.NO)}
-  finally{dr.saving=false;render()}
+  finally{dr.saving=false;saveDraftsSoon();render()}
 }
 async function saveMeet(){
   const m=drafts.meet;if(!m||m.saving)return;const f=m.f;
@@ -1209,18 +1542,17 @@ async function saveMeet(){
   try{
     if(m.fu&&f.due&&f.follow.trim()&&!calRefPart(f.calRef,'후속')){
       try{const p=await call(CFG.GC,'create_event',{summary:'['+f.area+'] 후속: '+(f.who?f.who+' – ':'')+firstLine(f.follow).slice(0,50),startTime:f.due+'T00:00:00',endTime:ymd(addD(pYmd(f.due),1))+'T00:00:00',allDay:true,description:'미팅·상담 기록: '+(f.title||f.who)});
-        const eid=(p&&(p.id||(p.event&&p.event.id)))||'';if(eid)f.calRef=setCalRef(f.calRef,'후속',eid);else f.calRef=setCalRef(f.calRef,'후속','등록됨');
-        covered.p=[];
+        f.calRef=setCalRef(f.calRef,'후속',(p&&p.id)||'등록됨');addLocal(p);
       }catch(e){warn=' 후속 일정은 등록하지 못했습니다: '+errMsg(e,CFG.GC)}
     }
     const props={'제목':f.title.trim()||(f.who+' 미팅'),'영역':f.area,'상대방':f.who,'장소':f.place,'안건':f.agenda,'논의 내용':f.notes,'결정 사항':f.decision,'후속조치':f.follow,'캘린더ID':f.calRef};
     if(f.date){if(f.time){props['date:일시:start']=f.date+'T'+f.time+':00'+tzOff();props['date:일시:is_datetime']=1}else{props['date:일시:start']=f.date;props['date:일시:is_datetime']=0}}
     else if(m.id)props['date:일시:start']=null;
     if(f.due){props['date:후속 기한:start']=f.due;props['date:후속 기한:is_datetime']=0}else if(m.id)props['date:후속 기한:start']=null;
-    if(m.id)await nUpdate(m.id,props);else m.id=await nCreate(CFG.ds.meet,props);
-    m.dirty=false;dropRows('meet:');ensure();toast('저장했습니다.'+warn);
+    if(m.id)await nUpdate(m.id,props,'meet');else m.id=await nCreate(CFG.ds.meet,props);
+    m.dirty=false;toast('저장했습니다.'+warn);
   }catch(e){writeErr(e,CFG.NO)}
-  finally{m.saving=false;render()}
+  finally{m.saving=false;saveDraftsSoon();render()}
 }
 async function saveIdea(){
   const m=drafts.idea;if(!m||m.saving)return;const f=m.f;
@@ -1229,14 +1561,21 @@ async function saveIdea(){
   try{
     const props={'제목':f.title.trim(),'영역':f.area,'상태':f.status,'내용':f.body};
     if(f.date){props['date:작성일:start']=f.date;props['date:작성일:is_datetime']=0}
-    if(m.id)await nUpdate(m.id,props);else m.id=await nCreate(CFG.ds.idea,props);
-    m.dirty=false;dropRows('idea:');ensure();toast('저장했습니다');
+    if(m.id)await nUpdate(m.id,props,'idea');else m.id=await nCreate(CFG.ds.idea,props);
+    m.dirty=false;toast('저장했습니다');
   }catch(e){writeErr(e,CFG.NO)}
-  finally{m.saving=false;render()}
+  finally{m.saving=false;saveDraftsSoon();render()}
 }
 async function saveHabits(){
   try{localStorage.setItem('diary2027.habits',JSON.stringify(habits))}catch(e){}
-  if(mcp){try{await confSet('habits',JSON.stringify(habits))}catch(e){toast('습관 설정을 저장하지 못했습니다')}}
+  if(LS.get('hadLogin')){try{await confSet('habits',JSON.stringify(habits))}catch(e){toast('습관 설정을 시트에 올리지 못했습니다. 이 기기에는 저장했습니다.')}}
+}
+/* 로그아웃: 이 기기에 남겨 둔 연결 정보와 저장본을 지운다 */
+function doLogout(){
+  ['token','hadLogin','hint','silentMode','needLogin','bounceAt','authState','frameTestAt','authLog'].forEach(k=>LS.del(k));
+  RAW.clear();EV.clear();for(const c in FRESH)FRESH[c]={};for(const k in TBL)delete TBL[k];for(const k in REVCAL)delete REVCAL[k];for(const k in CONF)delete CONF[k];dropRows();
+  tblSig=0;tblAt=0;forgetSheet();DB.del('events');DB.del('fresh');DB.del('tables');
+  ERR.gc=ERR.no=null;ERRC.p=ERRC.f=ERRC.h=null;AUTH.st='none';AUTH.err='';render();toast('로그아웃했습니다');
 }
 
 /* ---------- 입력 바인딩 ---------- */
@@ -1250,15 +1589,15 @@ function setBind(path,val){
   else if(p[0]==='hNew')HN[p[1]]=val;
 }
 function markDirty(){pagesEl.querySelectorAll('.savebar .st').forEach(s=>{s.textContent='저장하지 않은 내용이 있습니다';s.classList.add('dirty')})}
-book.addEventListener('input',e=>{const b=e.target.dataset&&e.target.dataset.bind;if(b)setBind(b,e.target.value)});
-book.addEventListener('change',e=>{const b=e.target.dataset&&e.target.dataset.bind;if(b)setBind(b,e.target.value)});
+book.addEventListener('input',e=>{const b=e.target.dataset&&e.target.dataset.bind;if(b){setBind(b,e.target.value);saveDraftsSoon()}});
+book.addEventListener('change',e=>{const b=e.target.dataset&&e.target.dataset.bind;if(b){setBind(b,e.target.value);saveDraftsSoon()}});
 book.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.matches('input[type=text]')){const btn=e.target.parentElement.querySelector('[data-act="goaladd"],[data-act="hadd"]');if(btn){e.preventDefault();btn.click()}}});
 function onClick(e){
   const el=e.target.closest('[data-act]');if(!el)return;
   if(el.tagName==='INPUT'&&el.type==='checkbox'&&!['goal','meetfu','neall'].includes(el.dataset.act))return;
   if(el.tagName==='BUTTON'||el.tagName==='A')e.stopPropagation();
   if(el.tagName==='A')return;
-  act(el.dataset.act,el.dataset,el);
+  Promise.resolve(act(el.dataset.act,el.dataset,el)).catch(e=>console.error(e)).then(saveDraftsSoon);
 }
 book.addEventListener('click',onClick);tabsEl.addEventListener('click',onClick);
 sheet.addEventListener('click',e=>{if(e.target===sheet){closeSheet();return}onClick(e)});
@@ -1273,29 +1612,87 @@ function detectMode(){
   document.getElementById('app').className=m;
   if(m!==S.mode){S.mode=m;if(m==='spread')S.page=0;render()}
 }
-setInterval(()=>{if(S.view==='day'&&same(S.cur,today())&&sheet.hidden&&!flipping&&!(document.activeElement&&pagesEl.contains(document.activeElement)))render()},60000);
+/* ---------- 주기 점검·복귀 ---------- */
+let proFor=0,lastForce=0,lastUpd=0;
+function tick(){
+  if(document.visibilityState!=='visible')return;
+  if(S.view==='day'&&same(S.cur,today())&&sheet.hidden&&!flipping&&!(document.activeElement&&pagesEl.contains(document.activeElement)))render();
+  if(!LS.get('hadLogin')||!navigator.onLine)return;
+  const tk=LS.get('token'),left=tk?tk.exp-Date.now():0;
+  if(left<=0){if(AUTH.st==='ok'||AUTH.st==='off')connect().then(ok=>{if(ok)ensure()})}
+  else if(left<5*60000&&proFor!==tk.exp){proFor=tk.exp;renew()}   // 만료 5분 전에 미리 연장
+}
+setInterval(tick,60000);
 let rz=null;addEventListener('resize',()=>{clearTimeout(rz);rz=setTimeout(detectMode,150)});
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&mcp&&!tokenValid()){authNeeded();return}if(document.visibilityState==='visible'&&mcp){const n=Date.now();if(n-(window.__lastVis||0)>5*60000){window.__lastVis=n;for(const c in covered)covered[c]=[];ensure(true)}}});
+/* 다른 앱에 다녀왔다가 돌아왔을 때 */
+async function resume(){
+  checkUpdate();
+  if(!LS.get('hadLogin'))return;
+  if(!(await connect()))return;
+  const n=Date.now();if(n-lastForce>30000){lastForce=n;ensure(true)}else ensure();
+}
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='hidden'){saveDraftsNow();if(UPD){persistState();location.reload()}return}
+  resume();
+});
+addEventListener('online',resume);
+addEventListener('offline',()=>{if(AUTH.st==='ok'&&!tokenValid())setAuth('off')});
+addEventListener('pagehide',saveDraftsNow);
+addEventListener('pointerdown',()=>{touched=true},{passive:true,capture:true});
+addEventListener('keydown',()=>{touched=true},{capture:true});
+
+/* ---------- 새 버전 ---------- */
+function onUpdate(){
+  // 막 열었고 아직 아무것도 누르지 않았으면 바로 새 버전으로 바꾼다. 아니면 화면을 떠날 때 바꾼다
+  if(Date.now()-T0<8000&&!touched&&!LS.get('drafts')&&Date.now()-(SS.get('updAt')||0)>120000){SS.set('updAt',Date.now());persistState();location.reload();return}
+  if(!UPD){UPD=true;if(S.view==='set')render()}
+}
+async function checkUpdate(){
+  const n=Date.now();if(n-lastUpd<600000)return;lastUpd=n;
+  try{
+    const c=navigator.serviceWorker&&navigator.serviceWorker.controller;if(!c||!window.caches)return;
+    c.postMessage({t:'d27-check'});await sleep(4000);
+    const r=await caches.match('./');if(!r)return;
+    const m=(await r.text()).match(/BUILD='([^']+)'/);
+    if(m&&m[1]!==BUILD)onUpdate();
+  }catch(e){}
+}
 
 /* ---------- 시작 ---------- */
-S.mode=(innerWidth>=640&&innerWidth>innerHeight*1.05)?'spread':'single';
-document.getElementById('app').className=S.mode;
-try{const ls=localStorage.getItem('diary2027.habits');if(ls){const a=JSON.parse(ls);if(Array.isArray(a))habits=a}}catch(e){}
-render();
-async function loadSettings(){
-  try{const m=await confGet();if(m.habits){const a=JSON.parse(m.habits);if(Array.isArray(a)&&a.length){habits=a;try{localStorage.setItem('diary2027.habits',JSON.stringify(a))}catch(e){}render()}}}catch(e){}
-}
-(()=>{
-  restoreState();
-  const a=readAuthHash();
-  if(tokenValid()){mcp={invalidate:async()=>{}};mcpState='ok';window.__lastVis=Date.now();render();ensure();loadSettings()}
-  else{
-    mcpState='login';
-    if(!(a&&a.error)&&LS.get('hadLogin')&&!SS.get('silentTried')){SS.set('silentTried',1);startAuth(true);return}
-    render();
+function boot(){
+  S.mode=(innerWidth>=640&&innerWidth>innerHeight*1.05)?'spread':'single';
+  document.getElementById('app').className=S.mode;
+  try{const ls=localStorage.getItem('diary2027.habits');if(ls){const a=JSON.parse(ls);if(Array.isArray(a))habits=a}}catch(e){}
+  restoreState();restoreDrafts();
+  const ret=readAuthHash();
+  // 구글에 다녀오려다 돌아오지 못한 흔적이 있으면(오류 화면 등) 자동으로는 다시 보내지 않는다
+  const pend=LS.get('authState');
+  if(pend&&!ret){LS.del('authState');if(pend.silent){LS.set('needLogin','noreturn');logAuth('redirect',false,'noreturn')}}
+  AUTH.st=tokenValid()?'ok':LS.get('hadLogin')?(navigator.onLine?'renew':'off'):'none';
+  // 숨은 창이 막혀 '다녀오는 방식'으로만 연장되는 기기는 화면을 그리기 전에 바로 다녀온다
+  if(AUTH.st==='renew'&&LS.get('silentMode')==='redirect'&&canBounce()&&!(ret&&ret.error)){startAuth(true);return}
+  if(ret&&ret.error){if(!ret.silent)LS.set('bounceAt',Date.now());if(AUTH.st==='renew'){AUTH.st='need';AUTH.err=ret.error}}
+  if('serviceWorker' in navigator){
+    navigator.serviceWorker.addEventListener('message',e=>{if(e.data&&e.data.t==='d27-update')onUpdate()});
+    navigator.serviceWorker.register('sw.js').catch(()=>{});
   }
-  if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
-})();
+  let loaded=false;
+  const cl=cacheLoad().catch(()=>{}).then(()=>{loaded=true});
+  Promise.race([cl,sleep(1500)]).then(async()=>{
+    booted=true;render();
+    if(!loaded)cl.then(()=>{dropRows();render()});
+    if(ret&&ret.error&&!ret.silent)toast(ret.error==='access_denied'?'로그인을 취소했습니다.':'로그인하지 못했습니다. ('+ret.error+')');
+    if(await connect()){
+      lastForce=Date.now();ensure(true);learnHint();
+      // '다녀오는 방식'인 기기도 하루에 한 번은 숨은 창 방식이 되는지 다시 확인한다
+      if(LS.get('silentMode')==='redirect'&&Date.now()-(LS.get('frameTestAt')||0)>864e5){LS.set('frameTestAt',Date.now());renew()}
+    }
+    setTimeout(checkUpdate,1500);
+  });
+}
+/* 상태 확인용(토큰·계정 주소는 내보내지 않는다) */
+window.__d27={ver:APP_VER,build:BUILD,state(){const t=LS.get('token');return {st:AUTH.st,err:AUTH.err,mode:LS.get('silentMode')||'',hint:!!LS.get('hint'),need:LS.get('needLogin')||'',left:t?Math.round((t.exp-Date.now())/1000):0,ev:EV.size,tabs:Object.keys(TBL).length,upd:UPD,log:(LS.get('authLog')||[]).map(x=>[x[1],x[2],x[3]||1])}}};
+boot();
 })();
 </script>
 </body>
