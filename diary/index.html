@@ -367,17 +367,22 @@ function restoreDrafts(){
    접속 토큰은 1시간짜리다. 만료되면 화면 뒤 숨은 창으로 조용히 새로 받고(silentFrame),
    그 방법이 막힌 기기에서는 화면 전체가 구글에 잠깐 다녀온다(startAuth(true)).
    둘 다 안 되면 저장해 둔 내용을 보여 주면서 '다시 연결'을 안내한다. */
-const APP_VER='2.0',BUILD='20261118.1';
+const APP_VER='2.0',BUILD='20261118.2';
 const AUTH_URL='https://accounts.google.com/o/oauth2/v2/auth';
 function redirectUri(){return location.origin+location.pathname.replace(/index\.html$/,'')}
 function rnd(){const a=new Uint8Array(12);crypto.getRandomValues(a);return [...a].map(b=>b.toString(16).padStart(2,'0')).join('')}
-function authUrl(state,silent){
+function authUrl(state,silent,consent){
   const p=new URLSearchParams({client_id:CFG.clientId,redirect_uri:redirectUri(),response_type:'token',scope:CFG.scope,include_granted_scopes:'true',state});
-  if(silent)p.set('prompt','none');
+  if(silent)p.set('prompt','none');else if(consent)p.set('prompt','consent');
   const h=LS.get('hint');if(h)p.set('login_hint',h);   // 여러 계정이 로그인된 기기에서 어느 계정인지 알려 줌
   return AUTH_URL+'?'+p.toString();
 }
-function saveToken(h){LS.set('token',{t:h.get('access_token'),exp:Date.now()+((+h.get('expires_in'))||3600)*1000-60000})}
+function saveToken(h){
+  LS.set('token',{t:h.get('access_token'),exp:Date.now()+((+h.get('expires_in'))||3600)*1000-60000});
+  // 로그인 화면에서 권한 체크를 빠뜨리면 일부만 허용된 토큰이 온다. 빠진 권한을 적어 두고 안내한다
+  const got=(h.get('scope')||'').split(/\s+/).filter(Boolean),miss=got.length?CFG.scope.split(' ').filter(x=>!got.includes(x)).map(x=>x.split('/').pop()):[];
+  if(miss.length)LS.set('scopeMiss',miss);else LS.del('scopeMiss');
+}
 function tokenValid(){const t=LS.get('token');return t&&t.exp>Date.now()?t.t:null}
 function logAuth(how,ok,err){
   const a=LS.get('authLog')||[],res=ok?'ok':String(err||'fail').slice(0,40),l=a[a.length-1];
@@ -387,11 +392,11 @@ function logAuth(how,ok,err){
 function setAuth(st,err){AUTH.err=err||'';if(AUTH.st===st)return;AUTH.st=st;if(booted)render()}
 const quiet=()=>sheet.hidden&&!flipping&&!(document.activeElement&&/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName));
 const canBounce=()=>!LS.get('needLogin')&&Date.now()-(LS.get('bounceAt')||0)>600000;
-function startAuth(silent){
+function startAuth(silent,consent){
   persistState();
   const st=rnd();LS.set('authState',{st,silent:!!silent});
   if(silent){LS.set('bounceAt',Date.now());location.replace(authUrl(st,true))}
-  else location.href=authUrl(st,false);
+  else location.href=authUrl(st,false,consent);
 }
 /* 구글에 다녀온 결과(주소 뒤 #…)를 읽는다 */
 function readAuthHash(){
@@ -889,6 +894,7 @@ function authNote(){
     case 'none':return '<div class="note">구글 계정으로 로그인하면 캘린더와 기록을 불러옵니다.<button class="btn sm primary" data-act="login">구글 로그인</button></div>';
     case 'need':return '<div class="note">구글 연결이 끊겨, 저장해 둔 내용을 보여 드립니다.<button class="btn sm primary" data-act="login">다시 연결</button></div>';
     case 'off':return '<div class="note">오프라인입니다. 저장해 둔 내용을 보여 드립니다.</div>';
+    case 'ok':{const m=LS.get('scopeMiss');return m&&m.length?'<div class="note err">구글 권한 중 '+m.map(x=>x.indexOf('calendar')>=0?'캘린더':'시트(드라이브)').join('·')+' 항목이 빠져 있습니다. 다시 받을 때 두 항목을 모두 체크해 주세요.<button class="btn sm" data-act="regrant">권한 다시 받기</button></div>':''}
     default:return '';
   }
 }
@@ -1408,6 +1414,7 @@ async function act(a,ds,el){
   case 'sugev':newEvSheet(ds.d||ymd(addD(today(),1)),ds.a,ds.c||'',ds.s,ds.e);break;
   case 'login':startAuth(false);break;
   case 'logout':doLogout();break;
+  case 'regrant':startAuth(false,true);break;
   case 'applyupd':persistState();location.reload();break;
   case 'evact':await evSetArea(ds.k,ds.a,ds.c);break;
   case 'evdone':await evDone(ds.k,ds.keep==='1');break;
@@ -1572,7 +1579,7 @@ async function saveHabits(){
 }
 /* 로그아웃: 이 기기에 남겨 둔 연결 정보와 저장본을 지운다 */
 function doLogout(){
-  ['token','hadLogin','hint','silentMode','needLogin','bounceAt','authState','frameTestAt','authLog'].forEach(k=>LS.del(k));
+  ['token','hadLogin','hint','silentMode','needLogin','bounceAt','authState','frameTestAt','authLog','scopeMiss'].forEach(k=>LS.del(k));
   RAW.clear();EV.clear();for(const c in FRESH)FRESH[c]={};for(const k in TBL)delete TBL[k];for(const k in REVCAL)delete REVCAL[k];for(const k in CONF)delete CONF[k];dropRows();
   tblSig=0;tblAt=0;forgetSheet();DB.del('events');DB.del('fresh');DB.del('tables');
   ERR.gc=ERR.no=null;ERRC.p=ERRC.f=ERRC.h=null;AUTH.st='none';AUTH.err='';render();toast('로그아웃했습니다');
