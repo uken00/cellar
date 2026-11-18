@@ -65,7 +65,7 @@ self.addEventListener('fetch',e=>{
   if(u.origin===self.location.origin){
     if(!u.pathname.startsWith(BASE))return;
     const rest=u.pathname.slice(BASE.length);
-    if(req.mode==='navigate'||rest===''||rest==='index.html'){e.respondWith(shell(e));return}
+    if(rest===''||rest==='index.html'){e.respondWith(shell(e));return}
     if(rest==='sw.js')return;
     e.respondWith(asset(e,req));return;
   }
