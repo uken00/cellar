@@ -367,7 +367,7 @@ function restoreDrafts(){
    접속 토큰은 1시간짜리다. 만료되면 화면 뒤 숨은 창으로 조용히 새로 받고(silentFrame),
    그 방법이 막힌 기기에서는 화면 전체가 구글에 잠깐 다녀온다(startAuth(true)).
    둘 다 안 되면 저장해 둔 내용을 보여 주면서 '다시 연결'을 안내한다. */
-const APP_VER='2.0',BUILD='20261118.3';
+const APP_VER='2.0',BUILD='20261118.4';
 const AUTH_URL='https://accounts.google.com/o/oauth2/v2/auth';
 function redirectUri(){return location.origin+location.pathname.replace(/index\.html$/,'')}
 function rnd(){const a=new Uint8Array(12);crypto.getRandomValues(a);return [...a].map(b=>b.toString(16).padStart(2,'0')).join('')}
@@ -410,7 +410,7 @@ function readAuthHash(){
   if(h.get('error'))err=h.get('error');else if(!as.st||h.get('state')!==as.st)err='state';
   if(err){logAuth(how,false,err);if(silent)LS.set('needLogin',err);return {error:err,silent}}
   saveToken(h);LS.set('hadLogin',true);LS.del('needLogin');
-  if(silent)LS.set('silentMode','redirect');
+  if(silent)LS.set('silentMode','redirect');else LS.set('consentV2',1);
   logAuth(how,true);return {ok:true,silent};
 }
 /* 화면 뒤 숨은 창으로 새 토큰 받기. 숨은 창 안에서는 <head>의 짧은 스크립트가 결과만 넘겨준다 */
@@ -1412,7 +1412,7 @@ async function act(a,ds,el){
   case 'sheetday':closeSheet();go('day',pYmd(ds.d),0);break;
   case 'listsheet':listSheet(ds.kind);break;
   case 'sugev':newEvSheet(ds.d||ymd(addD(today(),1)),ds.a,ds.c||'',ds.s,ds.e);break;
-  case 'login':startAuth(false);break;
+  case 'login':startAuth(false,!LS.get('consentV2'));break;
   case 'logout':doLogout();break;
   case 'regrant':startAuth(false,true);break;
   case 'applyupd':persistState();location.reload();break;
