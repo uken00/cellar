@@ -97,6 +97,7 @@ h3.sec small{font-family:var(--sans);font-weight:400;font-size:11.5px;color:var(
 .btn:active{background:var(--paper2)}
 .btn.primary{background:var(--ink);color:var(--paper);border-color:var(--ink)}
 .btn.sm{padding:3px 8px;font-size:12px}
+.wait{opacity:.45;pointer-events:none}
 .row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .spacer{flex:1}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--c,var(--ink3));flex:none}
@@ -341,10 +342,11 @@ const DB={
   del(k){return this.run('readwrite',s=>s.delete(k))}
 };
 /* 보던 화면: 구글에 다녀오거나 새 버전을 적용할 때만 잠깐 보관 */
-function persistState(){SS.set('state',{view:S.view,cur:ymd(S.cur),page:S.page,meetF:S.meetF,ideaF:S.ideaF});saveDraftsNow()}
+function persistState(){SS.set('state',{view:S.view,cur:ymd(S.cur),page:S.page,meetF:S.meetF,ideaF:S.ideaF,gt:G.text,ga:G.area});saveDraftsNow()}
 function restoreState(){
   const st=SS.get('state');if(!st)return;SS.del('state');
   S.view=st.view||S.view;S.cur=st.cur?pYmd(st.cur):S.cur;S.page=st.page||0;S.meetF=st.meetF||'전체';S.ideaF=st.ideaF||'전체';
+  if(st.gt)Object.assign(G.text,st.gt);if(st.ga)G.area=st.ga;
 }
 /* 쓰다 만 글: 입력할 때마다 기기에 남겨 두고, 저장하면 지운다 */
 let draftT=null;
@@ -367,7 +369,7 @@ function restoreDrafts(){
    접속 토큰은 1시간짜리다. 만료되면 화면 뒤 숨은 창으로 조용히 새로 받고(silentFrame),
    그 방법이 막힌 기기에서는 화면 전체가 구글에 잠깐 다녀온다(startAuth(true)).
    둘 다 안 되면 저장해 둔 내용을 보여 주면서 '다시 연결'을 안내한다. */
-const APP_VER='2.0',BUILD='20261118.4';
+const APP_VER='2.0',BUILD='20261118.5';
 const AUTH_URL='https://accounts.google.com/o/oauth2/v2/auth';
 function redirectUri(){return location.origin+location.pathname.replace(/index\.html$/,'')}
 function rnd(){const a=new Uint8Array(12);crypto.getRandomValues(a);return [...a].map(b=>b.toString(16).padStart(2,'0')).join('')}
@@ -459,20 +461,23 @@ async function lost(r){
   if(e==='offline'){setAuth('off');return 'off'}
   if(canBounce()&&document.visibilityState==='visible'){
     if(e==='timeout'&&!(await reachable())){setAuth('off');return 'off'}   // 통신이 안 될 때는 화면을 옮기지 않는다
-    if(quiet()&&!tokenValid()){startAuth(true);return 'bounce'}
+    if(quiet()&&!mut&&!tokenValid()){startAuth(true);return 'bounce'}
   }
   if(tokenValid()){setAuth('ok');return 'ok'}
   setAuth('need',e);return 'need';
 }
+let failAt=0,lostT=null;
 async function getToken(){
   let t=tokenValid();if(t){if(AUTH.st!=='ok')setAuth('ok');return t}
   if(!LS.get('hadLogin')){setAuth('none');throw {code:'auth'}}
-  if(AUTH.st==='need')throw {code:'auth'};
+  if(AUTH.st==='need'||Date.now()-failAt<5000)throw {code:'auth'};
   const r=await renew();
   t=tokenValid();if(t){setAuth('ok');return t}
-  const w=await lost(r);
-  if(w==='ok')return tokenValid();
-  throw {code:w==='off'?'network':'auth'};
+  if(r.err==='offline'){setAuth('off');throw {code:'network'}}
+  failAt=Date.now();
+  // 진행 중이던 저장이 끊기지 않도록, 화면을 구글로 옮길지는 이 요청이 끝난 뒤에 따로 판단한다
+  if(!lostT)lostT=setTimeout(()=>{lostT=null;if(!tokenValid())lost(r)},700);
+  throw {code:'auth'};
 }
 /* 앱을 열 때·돌아올 때: 토큰이 없으면 조용히 받아 본다 */
 async function connect(){
@@ -491,10 +496,15 @@ async function learnHint(){
   if(LS.get('hint')||!tokenValid())return;
   try{const r=await gfetch('https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)');const m=r&&r.user&&r.user.emailAddress;if(okMail(m))LS.set('hint',m)}catch(e){}
 }
+let mut=0;   // 진행 중인 쓰기 요청 수
 async function gfetch(url,opt,again){
   const tk=await getToken();
-  const o=Object.assign({},opt||{});o.headers=Object.assign({'Authorization':'Bearer '+tk},o.body?{'Content-Type':'application/json'}:{});
-  let r;try{r=await fetch(url,o)}catch(e){throw {code:'network',message:String(e&&e.message||e)}}
+  const o=Object.assign({},opt||{}),wr=!!(o.method&&o.method!=='GET');
+  o.headers=Object.assign({'Authorization':'Bearer '+tk},o.body?{'Content-Type':'application/json'}:{});
+  const ac=new AbortController(),tm=setTimeout(()=>ac.abort(),20000);o.signal=ac.signal;   // 응답이 없으면 20초 뒤 포기
+  let r;if(wr)mut++;
+  try{r=await fetch(url,o)}catch(e){throw {code:'network',message:String(e&&e.message||e)}}
+  finally{clearTimeout(tm);if(wr)mut--}
   if(r.status===401){LS.del('token');if(!again)return gfetch(url,opt,true);setAuth('need','401');throw {code:'auth'}}
   if(!r.ok){let m='';try{const j=await r.json();m=(j.error&&j.error.message)||''}catch(e){}throw {code:r.status===403?'forbidden':r.status===429?'rate_limited':'http',status:r.status,message:m,retryable:r.status>=500||r.status===429}}
   if(r.status===204)return {};
@@ -582,7 +592,7 @@ function hash(s){let h=5381;for(let i=0;i<s.length;i++)h=((h<<5)+h+s.charCodeAt(
 let tblP=null,tblAt=0,tblSig=0,tbT=null,writing=0,wseq=0;
 const TBL_TTL=180000;
 function applyConf(){
-  if(!CONF.habits)return;
+  if(LS.get('habitsDirty')||!CONF.habits)return;   // 이 기기에서 바꾼 습관이 아직 시트에 안 올라갔으면 덮어쓰지 않는다
   try{const a=JSON.parse(CONF.habits);if(Array.isArray(a)&&a.length){habits=a;try{localStorage.setItem('diary2027.habits',JSON.stringify(a))}catch(e){}}}catch(e){}
 }
 function saveTablesSoon(){if(tbT)return;tbT=setTimeout(()=>{tbT=null;const tabs={};for(const k in TBL)tabs[k]=TBL[k];DB.set('tables',{v:1,at:tblAt,sig:tblSig,sheet:SHEET_ID,tabs,conf:Object.assign({},CONF)})},1200)}
@@ -608,6 +618,7 @@ function syncTables(force){
       if(writing||wseq!==w0){tblAt=0;setTimeout(()=>syncTables(),1500);return false}   // 받는 사이 저장이 있었으면 버리고 다시 받는다
       const sig=hash(JSON.stringify(vr));
       tblAt=lastSync=Date.now();ERR.no=null;
+      if(LS.get('habitsDirty'))pushHabits().catch(()=>{});   // 못 올렸던 습관 변경을 지금 올린다
       if(sig===tblSig)return false;
       tblSig=sig;
       names.forEach((k,i)=>{
@@ -1223,8 +1234,8 @@ function vIdea(){
 /* 설정 */
 function vSet(){
   let L=head('설정','')+'<div class="body">';
-  L+='<h3 class="sec">습관<small>주간 목표 횟수</small></h3>';
-  L+=habits.map((h,i)=>'<div class="goal"><span class="x">'+esc(h.name)+'</span><span class="muted">주 '+h.n+'회</span><button class="btn sm" data-act="hdel" data-i="'+i+'">삭제</button></div>').join('');
+  L+='<h3 class="sec">습관<small>'+(LS.get('habitsDirty')&&LS.get('hadLogin')?'구글 시트에 올리는 중':'주간 목표 횟수')+'</small></h3>';
+  L+=habits.map((h,i)=>'<div class="goal"><span class="x">'+esc(h.name)+'</span><span class="muted">주 '+h.n+'회</span><button class="btn sm" data-act="hdel" data-n="'+esc(h.name)+'">삭제</button></div>').join('');
   L+='<div class="addrow"><input type="text" data-bind="hNew.name" placeholder="새 습관" value="'+esc(HN.name)+'"><select data-bind="hNew.n" style="flex:none">'+[1,2,3,4,5,6,7].map(n=>'<option value="'+n+'"'+(+HN.n===n?' selected':'')+'>주 '+n+'회</option>').join('')+'</select><button class="btn sm" data-act="hadd">추가</button></div>';
   L+='<h3 class="sec">일정 구분 방법</h3><div style="font-size:12.5px;line-height:1.75;color:var(--ink2)">';
   L+='<div>캘린더 제목 앞 [영역·활동] 말머리로 구분합니다. 예: [대신·미팅] 상속 평가 의뢰 – 곽OO 세무사</div>';
@@ -1447,8 +1458,8 @@ async function act(a,ds,el){
   case 'ideaarea':drafts.idea.f.area=ds.a;drafts.idea.dirty=true;render();break;
   case 'ideasave':await saveIdea();break;
   case 'ideaclose':guardIdea(()=>{drafts.idea=null;if(S.mode==='single')S.page=0;render()});break;
-  case 'hdel':habits.splice(+ds.i,1);await saveHabits();render();break;
-  case 'hadd':{const n=HN.name.trim();if(!n){toast('습관 이름을 적어 주세요');return}if(habits.some(h=>h.name===n)){toast('이미 있는 습관입니다');return}habits.push({name:n,n:+HN.n||3});HN.name='';await saveHabits();render();break}
+  case 'hdel':{const i=habits.findIndex(h=>h.name===ds.n);if(i<0)return;habits.splice(i,1);render();saveHabits();break}
+  case 'hadd':{const n=HN.name.trim();if(!n){toast('습관 이름을 적어 주세요');return}if(habits.some(h=>h.name===n)){toast('이미 있는 습관입니다');return}habits.push({name:n,n:+HN.n||3});HN.name='';render();saveHabits();break}
   }
 }
 function findRow(prefix,id){return rowsOf(prefix.replace(/:$/,'')).find(x=>rowId(x)===id)||null}
@@ -1573,13 +1584,30 @@ async function saveIdea(){
   }catch(e){writeErr(e,CFG.NO)}
   finally{m.saving=false;saveDraftsSoon();render()}
 }
+/* 습관 목록: 화면과 기기에는 바로 반영하고 구글 시트에는 뒤에서 올린다.
+   못 올렸으면 표시(habitsDirty)를 남겨 두었다가 연결되면 다시 올리고, 그동안은 시트 값으로 덮어쓰지 않는다 */
+let habitP=null;
+function pushHabits(){
+  if(habitP)return habitP;
+  habitP=(async()=>{
+    for(let n=0;n<5&&LS.get('habitsDirty');n++){
+      const stamp=LS.get('habitsDirty');
+      await confSet('habits',JSON.stringify(habits));
+      if(LS.get('habitsDirty')===stamp)LS.del('habitsDirty');   // 올리는 사이 또 바꿨으면 한 번 더 올린다
+    }
+  })();
+  habitP.then(()=>{habitP=null;if(S.view==='set')render()},()=>{habitP=null;if(S.view==='set')render()});
+  return habitP;
+}
 async function saveHabits(){
   try{localStorage.setItem('diary2027.habits',JSON.stringify(habits))}catch(e){}
-  if(LS.get('hadLogin')){try{await confSet('habits',JSON.stringify(habits))}catch(e){toast('습관 설정을 시트에 올리지 못했습니다. 이 기기에는 저장했습니다.')}}
+  LS.set('habitsDirty',Date.now());
+  if(!LS.get('hadLogin'))return;
+  try{await pushHabits()}catch(e){toast('습관을 이 기기에 저장했습니다. 구글 시트에는 연결되면 올립니다.')}
 }
 /* 로그아웃: 이 기기에 남겨 둔 연결 정보와 저장본을 지운다 */
 function doLogout(){
-  ['token','hadLogin','hint','silentMode','needLogin','bounceAt','authState','frameTestAt','authLog','scopeMiss'].forEach(k=>LS.del(k));
+  ['token','hadLogin','hint','silentMode','needLogin','bounceAt','authState','frameTestAt','authLog','scopeMiss','habitsDirty'].forEach(k=>LS.del(k));
   RAW.clear();EV.clear();for(const c in FRESH)FRESH[c]={};for(const k in TBL)delete TBL[k];for(const k in REVCAL)delete REVCAL[k];for(const k in CONF)delete CONF[k];dropRows();
   tblSig=0;tblAt=0;forgetSheet();DB.del('events');DB.del('fresh');DB.del('tables');
   ERR.gc=ERR.no=null;ERRC.p=ERRC.f=ERRC.h=null;AUTH.st='none';AUTH.err='';render();toast('로그아웃했습니다');
@@ -1604,7 +1632,8 @@ function onClick(e){
   if(el.tagName==='INPUT'&&el.type==='checkbox'&&!['goal','meetfu','neall'].includes(el.dataset.act))return;
   if(el.tagName==='BUTTON'||el.tagName==='A')e.stopPropagation();
   if(el.tagName==='A')return;
-  Promise.resolve(act(el.dataset.act,el.dataset,el)).catch(e=>console.error(e)).then(saveDraftsSoon);
+  const bt=el.tagName==='BUTTON'?el:null;if(bt)bt.classList.add('wait');
+  Promise.resolve(act(el.dataset.act,el.dataset,el)).catch(e=>console.error(e)).then(()=>{if(bt)bt.classList.remove('wait');saveDraftsSoon()});
 }
 book.addEventListener('click',onClick);tabsEl.addEventListener('click',onClick);
 sheet.addEventListener('click',e=>{if(e.target===sheet){closeSheet();return}onClick(e)});
@@ -1620,14 +1649,18 @@ function detectMode(){
   if(m!==S.mode){S.mode=m;if(m==='spread')S.page=0;render()}
 }
 /* ---------- 주기 점검·복귀 ---------- */
-let proFor=0,lastForce=0,lastUpd=0;
+let proBusy=false,lastForce=0,lastUpd=0;
 function tick(){
   if(document.visibilityState!=='visible')return;
   if(S.view==='day'&&same(S.cur,today())&&sheet.hidden&&!flipping&&!(document.activeElement&&pagesEl.contains(document.activeElement)))render();
   if(!LS.get('hadLogin')||!navigator.onLine)return;
   const tk=LS.get('token'),left=tk?tk.exp-Date.now():0;
-  if(left<=0){if(AUTH.st==='ok'||AUTH.st==='off')connect().then(ok=>{if(ok)ensure()})}
-  else if(left<5*60000&&proFor!==tk.exp){proFor=tk.exp;renew()}   // 만료 5분 전에 미리 연장
+  if(left<=0){if(AUTH.st==='ok'||AUTH.st==='off'||(AUTH.st==='need'&&canBounce()))connect().then(ok=>{if(ok)ensure()})}
+  else if(left<5*60000&&!proBusy){
+    // 만료 5분 전부터 미리 연장한다. 숨은 창이 막힌 기기는 쓰는 중이 아닐 때 화면이 잠깐 다녀온다
+    proBusy=true;
+    renew().then(r=>{proBusy=false;if(!r.ok&&LS.get('silentMode')==='redirect'&&canBounce()&&quiet()&&!mut&&document.visibilityState==='visible')startAuth(true)},()=>{proBusy=false});
+  }
 }
 setInterval(tick,60000);
 let rz=null;addEventListener('resize',()=>{clearTimeout(rz);rz=setTimeout(detectMode,150)});
