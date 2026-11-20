@@ -194,10 +194,12 @@ textarea{display:block;width:100%;font-family:inherit;font-size:13.5px;color:var
 textarea.t2{min-height:52px}
 textarea.t4{min-height:104px}
 textarea.t6{min-height:156px}
-/* 긴 글 칸: 쪽에서는 안쪽 스크롤 없이 전체를 보여 주고, 누르면 큰 글씨로 연다 */
-.tv{font-size:14.5px;line-height:26px;min-height:52px;padding:0 2px;white-space:pre-wrap;word-break:keep-all;overflow-wrap:anywhere;cursor:pointer;
+/* 긴 글 칸: 쪽에서는 앞의 몇 줄만 보여 주고(안쪽 스크롤 없음), 누르면 큰 글씨 팝업으로 전체를 연다 */
+.tv{font-size:14.5px;line-height:26px;min-height:52px;max-height:78px;padding:0 2px;white-space:pre-wrap;word-break:keep-all;overflow-wrap:anywhere;cursor:pointer;position:relative;
+  display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden;
   background-image:linear-gradient(to bottom,transparent 25px,var(--rule) 25px);background-size:100% 26px}
-.tv.t6{min-height:156px}
+.tv.t6{min-height:78px;max-height:156px;-webkit-line-clamp:6}
+.tv.clip::after{content:'더 보기 ›';position:absolute;right:0;bottom:1px;height:25px;line-height:25px;padding-left:12px;background:var(--paper);color:var(--ink2);font-size:12.5px}
 .tv.blank{color:var(--ink3);font-size:13px}
 #sheet.top{align-items:flex-start}
 #sheet .pan.zoom{max-width:680px;display:flex;flex-direction:column;overflow:hidden;padding:14px 16px}
@@ -392,7 +394,7 @@ function restoreDrafts(){
    접속 토큰은 1시간짜리다. 만료되면 화면 뒤 숨은 창으로 조용히 새로 받고(silentFrame),
    그 방법이 막힌 기기에서는 화면 전체가 구글에 잠깐 다녀온다(startAuth(true)).
    둘 다 안 되면 저장해 둔 내용을 보여 주면서 '다시 연결'을 안내한다. */
-const APP_VER='2.0',BUILD='20261120.2';
+const APP_VER='2.0',BUILD='20261120.3';
 const AUTH_URL='https://accounts.google.com/o/oauth2/v2/auth';
 function redirectUri(){return location.origin+location.pathname.replace(/index\.html$/,'')}
 function rnd(){const a=new Uint8Array(12);crypto.getRandomValues(a);return [...a].map(b=>b.toString(16).padStart(2,'0')).join('')}
@@ -1335,7 +1337,7 @@ function render(){
     '<span class="gap"></span><button class="mini" data-act="today">오늘</button>'+(S.mode==='spread'?'<span id="syncdot" class="sync"></span>':'');
   syncDot();
   restoreFocus(f,sameView);
-  syncZoom();
+  markMore();syncZoom();
   if(S.view==='day'){const b=pagesEl.querySelector('.body[data-scroll]');if(b&&(!sameView||b.dataset.ak!==window.__ak)){b.scrollTop=+b.dataset.scroll;window.__ak=b.dataset.ak}}
 }
 
@@ -1439,6 +1441,8 @@ function fitSheet(){
   p.style.maxHeight=Math.max(200,h-32)+'px';
   const st=ta.scrollTop;ta.style.height='auto';ta.style.height=Math.max(Math.round(zfs()*1.7*6),ta.scrollHeight+2)+'px';ta.scrollTop=st;
 }
+/* 글 상자의 내용이 보이는 줄 수를 넘으면 '더 보기'를 붙인다 */
+function markMore(){pagesEl.querySelectorAll('.tv').forEach(e=>e.classList.toggle('clip',e.scrollHeight>e.clientHeight+1))}
 /* 팝업을 연 채로 시트에서 새 내용이 들어왔고 아직 손대지 않았으면 팝업 글도 맞춘다 */
 function syncZoom(){
   if(sheet.hidden||!sheetCtx||!sheetCtx.zoom||sheetCtx.touched)return;
