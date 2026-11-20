@@ -276,7 +276,17 @@ const md=d=>(d.getMonth()+1)+'.'+d.getDate();
 const same=(a,b)=>a&&b&&a.getFullYear()===b.getFullYear()&&a.getMonth()===b.getMonth()&&a.getDate()===b.getDate();
 function tzOff(){const o=-new Date().getTimezoneOffset();const s=o>=0?'+':'-';const a=Math.abs(o);return s+pad(Math.floor(a/60))+':'+pad(a%60)}
 function wkLabel(d){const th=addD(wkStart(d),3);return {m:th.getMonth()+1,n:Math.floor((th.getDate()-1)/7)+1,y:th.getFullYear()}}
-function pDT(s){if(!s)return null;s=String(s);if(s.length<=10)return pYmd(s);const d=new Date(s);return isNaN(d)?null:d}
+function pDT(s){if(!s)return null;s=normDT(String(s));if(s.length<=10)return pYmd(s);const d=new Date(s);return isNaN(d)?null:d}
+/* 시트에 사람이나 다른 비서가 적은 날짜('2026. 11. 20 오후 2:00:00', '2026/11/20 14:00' 등)를 '2026-11-20T14:00' 꼴로 맞춘다 */
+function normDT(s){
+  s=s.trim();if(/^\d{4}-\d{2}-\d{2}(T|$)/.test(s))return s;
+  const m=s.match(/^(\d{4})\s*[.\/-]\s*(\d{1,2})\s*[.\/-]\s*(\d{1,2})\.?(?:\s*\([^)]*\))?(?:\s+(오전|오후|AM|PM)?\s*(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?)?$/i);
+  if(!m)return s;
+  const ymd=m[1]+'-'+pad(+m[2])+'-'+pad(+m[3]);if(m[5]==null)return ymd;
+  let h=+m[5];const ap=(m[4]||m[7]||'').toUpperCase();
+  if((ap==='오후'||ap==='PM')&&h<12)h+=12;if((ap==='오전'||ap==='AM')&&h===12)h=0;
+  return ymd+'T'+pad(h)+':'+m[6];
+}
 
 /* ---------- 상태 ---------- */
 const S={view:'week',cur:today(),page:0,mode:'spread',meetF:'전체',ideaF:'전체'};
@@ -369,7 +379,7 @@ function restoreDrafts(){
    접속 토큰은 1시간짜리다. 만료되면 화면 뒤 숨은 창으로 조용히 새로 받고(silentFrame),
    그 방법이 막힌 기기에서는 화면 전체가 구글에 잠깐 다녀온다(startAuth(true)).
    둘 다 안 되면 저장해 둔 내용을 보여 주면서 '다시 연결'을 안내한다. */
-const APP_VER='2.0',BUILD='20261118.5';
+const APP_VER='2.0',BUILD='20261120.1';
 const AUTH_URL='https://accounts.google.com/o/oauth2/v2/auth';
 function redirectUri(){return location.origin+location.pathname.replace(/index\.html$/,'')}
 function rnd(){const a=new Uint8Array(12);crypto.getRandomValues(a);return [...a].map(b=>b.toString(16).padStart(2,'0')).join('')}
@@ -579,8 +589,9 @@ function parseTab(ds,vals){
   for(let i=1;i<vals.length;i++){
     const v=vals[i];if(!v||!v.length)continue;
     const o={_row:i+1};t.cols.forEach(([h,k])=>{o[k||h]=''});
-    hdr.forEach((h,j)=>{const x=v[j]!=null?String(v[j]):'';if(known[h])o[known[h]]=x;else if(x)o['x:'+h]=x});   // 직접 추가한 열도 보존
-    if(!o.id)continue;o.url=o.id;rows.push(o);
+    hdr.forEach((h,j)=>{let x=v[j]!=null?String(v[j]):'';if(known[h]){if(known[h].startsWith('date:')&&x)x=normDT(x);o[known[h]]=x}else if(x)o['x:'+h]=x});   // 직접 추가한 열도 보존
+    if(!o.id){if(!v.some(x=>String(x==null?'':x).trim()))continue;o.id=newId();o._newId=true}   // 다른 곳에서 넣은 줄: id를 새로 붙이고 시트에도 적는다
+    o.url=o.id;rows.push(o);
   }
   return {hdr,rows};
 }
@@ -625,6 +636,7 @@ function syncTables(force){
         if(k==='conf'){for(const x in CONF)delete CONF[x];vr[i].slice(1).forEach(v=>{if(v&&v[0])CONF[v[0]]=v[1]==null?'':String(v[1])})}
         else TBL[k]=parseTab(k,vr[i]);
       });
+      fillIds(id).catch(()=>{});
       applyConf();tblChanged();
       return true;
     }catch(e){
@@ -635,6 +647,15 @@ function syncTables(force){
   })();
   tblP.then(ch=>{if(ch)render()});
   return tblP;
+}
+/* id 없이 들어온 줄에 붙인 id를 시트 A열(또는 id 열)에 적어 둔다 */
+async function fillIds(sid){
+  const data=[];
+  for(const k in TBL){const tb=TBL[k];if(!tb||!tb.rows)continue;const c=tb.hdr.indexOf('id');if(c<0)continue;
+    tb.rows.forEach(r=>{if(r._newId){data.push({range:"'"+STAB[k].name+"'!"+colName(c+1)+r._row,values:[[r.id]]});delete r._newId}})}
+  if(!data.length)return;
+  writing++;wseq++;
+  try{await gfetch(SHEETS+sid+'/values:batchUpdate',{method:'POST',body:JSON.stringify({valueInputOption:'RAW',data})})}finally{writing--}
 }
 async function nCreate(ds,props){
   if(!TBL[ds])await syncTables(true);
